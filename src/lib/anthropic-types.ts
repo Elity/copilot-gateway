@@ -1,4 +1,4 @@
-// Anthropic API type definitions
+export const THINKING_PLACEHOLDER = "Thinking...";
 
 export interface AnthropicMessagesPayload {
   model: string;
@@ -16,7 +16,8 @@ export interface AnthropicMessagesPayload {
     type: "auto" | "any" | "tool" | "none";
     name?: string;
   };
-  thinking?: { type: "enabled"; budget_tokens?: number };
+  thinking?: { type: "enabled" | "adaptive"; budget_tokens?: number };
+  output_config?: { effort?: "low" | "medium" | "high" | "max" };
   service_tier?: "auto" | "standard_only";
 }
 
@@ -51,6 +52,7 @@ export interface AnthropicToolUseBlock {
 export interface AnthropicThinkingBlock {
   type: "thinking";
   thinking: string;
+  signature?: string;
 }
 
 export type AnthropicUserContentBlock =
@@ -186,6 +188,17 @@ export interface AnthropicStreamState {
       id: string;
       name: string;
       anthropicBlockIndex: number;
+      consecutiveWhitespace: number;
     };
   };
+  /** Set to true when infinite whitespace is detected in tool call arguments */
+  aborted?: boolean;
+  /** Whether a thinking block is currently open (for reasoning_text) */
+  thinkingBlockOpen?: boolean;
+  /** Whether any thinking content was emitted (via reasoning_text) */
+  thinkingHasContent?: boolean;
+  /** Whether a signature_delta was already emitted for the current thinking block */
+  thinkingSignatureSent?: boolean;
+  /** Accumulated reasoning_opaque when no thinking block was open to receive it */
+  pendingReasoningOpaque?: string;
 }
