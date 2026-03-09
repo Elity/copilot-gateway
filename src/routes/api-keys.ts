@@ -5,7 +5,7 @@ import { createApiKey, listApiKeys, deleteApiKey, rotateApiKey, type ApiKey } fr
 import { requireAdmin } from "../lib/auth-guard.ts";
 
 function keyToJson(k: ApiKey) {
-  return { id: k.id, name: k.name, key_hint: k.key.slice(-4), created_at: k.createdAt, last_used_at: k.lastUsedAt ?? null };
+  return { id: k.id, name: k.name, key: k.key, created_at: k.createdAt, last_used_at: k.lastUsedAt ?? null };
 }
 
 export const listKeys = (c: Context) => {

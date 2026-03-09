@@ -13,7 +13,28 @@ export function LoginPage() {
         <div class="fixed top-0 left-1/2 -translate-x-1/2 w-[600px] h-[400px] bg-accent-cyan/5 rounded-full blur-[120px] pointer-events-none"></div>
 
         <div class="w-full max-w-md" x-data="loginApp()">
-          <!-- Logo & Title -->
+          <!-- Auto-login spinner -->
+          <template x-if="autoLogin">
+            <div class="flex flex-col items-center gap-4 animate-in">
+              <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-surface-700 glow-border">
+                <svg class="w-8 h-8 text-accent-cyan" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                  <path d="M2 17l10 5 10-5"/>
+                  <path d="M2 12l10 5 10-5"/>
+                </svg>
+              </div>
+              <div class="flex items-center gap-2.5 text-gray-400">
+                <svg class="animate-spin h-4 w-4 text-accent-cyan/60" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" fill="none" opacity="0.25"/>
+                  <path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" opacity="0.75"/>
+                </svg>
+                <span class="text-sm">Signing in…</span>
+              </div>
+            </div>
+          </template>
+
+          <template x-if="!autoLogin">
+          <div>
           <div class="text-center mb-8 animate-in">
             <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-surface-700 glow-border mb-6">
               <svg class="w-8 h-8 text-accent-cyan" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -65,6 +86,8 @@ export function LoginPage() {
               Powered by GitHub Copilot API
             </p>
           </div>
+          </div>
+          </template>
         </div>
       </div>
 
@@ -73,12 +96,14 @@ export function LoginPage() {
           return {
             authKey: '',
             loading: false,
+            autoLogin: false,
             error: '',
             init() {
               // If already have a stored key, try to verify it
               const stored = localStorage.getItem('authKey');
               if (stored) {
                 this.authKey = stored;
+                this.autoLogin = true;
                 this.login();
               }
             },
@@ -108,9 +133,11 @@ export function LoginPage() {
                 } else {
                   localStorage.removeItem('authKey');
                   localStorage.removeItem('isAdmin');
+                  this.autoLogin = false;
                   this.error = data.error || 'Authentication failed';
                 }
               } catch (e) {
+                this.autoLogin = false;
                 this.error = 'Connection error';
               } finally {
                 this.loading = false;

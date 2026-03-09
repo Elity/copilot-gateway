@@ -286,31 +286,16 @@ export function DashboardPage() {
                   <input type="text" x-model="newKeyName" placeholder="Name" class="!text-xs !py-1.5 !px-3 !w-32 !rounded-lg" @keydown.enter="createNewKey()" />
                   <button @click="createNewKey()" class="btn-primary !text-xs !py-1.5 !px-3 !rounded-lg whitespace-nowrap" :disabled="!newKeyName.trim() || keyCreating">
                     <span x-show="!keyCreating">+ Create</span>
-                    <span x-show="keyCreating">...</span>
+                    <span x-show="keyCreating" class="flex items-center gap-1.5">
+                      <svg class="animate-spin h-3 w-3" viewBox="0 0 24 24">
+                        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" fill="none" opacity="0.25"/>
+                        <path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" opacity="0.75"/>
+                      </svg>
+                      Creating…
+                    </span>
                   </button>
                 </div>
               </div>
-
-              <!-- New Key Result -->
-              <template x-if="newKeyResult">
-                <div class="mb-6 p-4 rounded-xl bg-accent-emerald/5 border border-accent-emerald/20 animate-in">
-                  <div class="flex items-center gap-2 mb-2">
-                    <svg class="w-4 h-4 text-accent-emerald" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-                      <polyline points="22 4 12 14.01 9 11.01"/>
-                    </svg>
-                    <span class="text-sm font-medium text-accent-emerald">New key for <span x-text="newKeyResult.name"></span></span>
-                  </div>
-                  <div class="flex items-center gap-2 mb-2">
-                    <code class="flex-1 text-xs font-mono text-gray-300 bg-surface-900 rounded-lg px-3 py-2 break-all select-all" x-text="newKeyResult.key"></code>
-                    <button @click="copySnippet(newKeyResult.key, 'key')" class="btn-ghost text-xs px-3 py-2 shrink-0">
-                      <span x-text="copied === 'key' ? 'Copied!' : 'Copy'"></span>
-                    </button>
-                  </div>
-                  <p class="text-xs text-accent-amber">Save this key now — it won't be shown again.</p>
-                  <button @click="newKeyResult = null" class="btn-ghost text-xs mt-2">Dismiss</button>
-                </div>
-              </template>
 
               <!-- Key List -->
               <div class="overflow-x-auto">
@@ -327,21 +312,27 @@ export function DashboardPage() {
                   <table class="w-full text-sm">
                     <thead>
                       <tr class="border-b border-white/5">
-                        <th class="text-left py-2 pr-4 text-xs font-medium text-gray-500 uppercase tracking-widest">Name</th>
+                        <th class="text-left py-2 pr-4 pl-7 text-xs font-medium text-gray-500 uppercase tracking-widest">Name</th>
                         <th class="text-left py-2 pr-4 text-xs font-medium text-gray-500 uppercase tracking-widest">Key</th>
                         <th class="text-left py-2 pr-4 text-xs font-medium text-gray-500 uppercase tracking-widest">Created</th>
                         <th class="text-left py-2 pr-4 text-xs font-medium text-gray-500 uppercase tracking-widest">Last Used</th>
-                        <th x-show="isAdmin" class="text-right py-2 text-xs font-medium text-gray-500 uppercase tracking-widest">Actions</th>
+                        <th class="text-right py-2 pr-2 text-xs font-medium text-gray-500 uppercase tracking-widest">Actions</th>
                       </tr>
                     </thead>
                     <tbody>
                       <template x-for="k in keys" :key="k.id">
-                        <tr class="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
-                          <td class="py-3 pr-4">
-                            <span class="text-white font-medium" x-text="k.name"></span>
+                        <tr @click="selectedKeyId = k.id"
+                            class="border-b border-white/[0.03] transition-colors cursor-pointer"
+                            :class="selectedKeyId === k.id ? 'bg-accent-cyan/5 hover:bg-accent-cyan/8' : 'hover:bg-white/[0.02]'">
+                          <td class="py-3 pr-4 pl-2">
+                            <div class="flex items-center gap-2">
+                              <div class="w-1.5 h-1.5 rounded-full shrink-0 transition-colors"
+                                   :class="selectedKeyId === k.id ? 'bg-accent-cyan' : 'bg-transparent'"></div>
+                              <span class="text-white font-medium" x-text="k.name"></span>
+                            </div>
                           </td>
                           <td class="py-3 pr-4">
-                            <code class="text-xs font-mono text-gray-500 bg-surface-800 rounded px-2 py-1" x-text="'...' + k.key_hint"></code>
+                            <code class="text-xs font-mono text-gray-500 bg-surface-800 rounded px-2 py-1" x-text="truncateKey(k.key)"></code>
                           </td>
                           <td class="py-3 pr-4">
                             <span class="text-gray-500 text-xs cursor-default" :title="fullDateTime(k.created_at)" x-text="timeAgo(k.created_at)"></span>
@@ -350,22 +341,30 @@ export function DashboardPage() {
                             <span x-show="k.last_used_at" class="text-gray-500 text-xs cursor-default" :title="fullDateTime(k.last_used_at)" x-text="timeAgo(k.last_used_at)"></span>
                             <span x-show="!k.last_used_at" class="text-gray-600 text-xs">Never</span>
                           </td>
-                          <td x-show="isAdmin" class="py-3 text-right">
+                          <td class="py-3 pr-2 text-right">
                             <div class="flex items-center justify-end gap-1">
-                              <button @click="rotateKeyById(k.id, k.name)" class="text-gray-600 hover:text-accent-amber transition-colors p-1" :disabled="keyRotating === k.id" title="Rotate key">
-                                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                  <path d="M21.5 2v6h-6"/>
-                                  <path d="M2.5 22v-6h6"/>
-                                  <path d="M2.5 12a10 10 0 0 1 16.5-5.7L21.5 8"/>
-                                  <path d="M21.5 12a10 10 0 0 1-16.5 5.7L2.5 16"/>
-                                </svg>
+                              <button @click.stop="copySnippet(k.key, 'key-' + k.id)" class="text-gray-600 hover:text-accent-cyan transition-colors p-1" title="Copy key">
+                                <svg x-show="copied !== 'key-' + k.id" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                                <svg x-show="copied === 'key-' + k.id" class="w-4 h-4 text-accent-emerald" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
                               </button>
-                              <button @click="deleteKeyById(k.id, k.name)" class="text-gray-600 hover:text-accent-rose transition-colors p-1" :disabled="keyDeleting === k.id" title="Delete key">
-                                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                  <polyline points="3 6 5 6 21 6"/>
-                                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                                </svg>
-                              </button>
+                              <template x-if="isAdmin">
+                                <button @click.stop="rotateKeyById(k.id, k.name)" class="text-gray-600 hover:text-accent-amber transition-colors p-1" :disabled="keyRotating === k.id" title="Rotate key">
+                                  <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21.5 2v6h-6"/>
+                                    <path d="M2.5 22v-6h6"/>
+                                    <path d="M2.5 12a10 10 0 0 1 16.5-5.7L21.5 8"/>
+                                    <path d="M21.5 12a10 10 0 0 1-16.5 5.7L2.5 16"/>
+                                  </svg>
+                                </button>
+                              </template>
+                              <template x-if="isAdmin">
+                                <button @click.stop="deleteKeyById(k.id, k.name)" class="text-gray-600 hover:text-accent-rose transition-colors p-1" :disabled="keyDeleting === k.id" title="Delete key">
+                                  <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="3 6 5 6 21 6"/>
+                                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                                  </svg>
+                                </button>
+                              </template>
                             </div>
                           </td>
                         </tr>
@@ -379,10 +378,10 @@ export function DashboardPage() {
             <!-- Configuration Guide -->
             <div class="glass-card p-6 animate-in delay-1">
               <span class="text-xs font-medium text-gray-500 uppercase tracking-widest">Configuration</span>
-              <template x-if="newKeyResult">
+              <template x-if="selectedKeyId">
                 <p class="text-xs text-accent-cyan mt-2 flex items-center gap-1.5">
                   <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
-                  Configs below use your newly created key. Copy them before dismissing.
+                  Configs below use the selected key.
                 </p>
               </template>
 
@@ -497,6 +496,17 @@ export function DashboardPage() {
               </div>
 
               <div style="height: 320px; position: relative;">
+                <template x-if="tokenLoading && !tokenChart">
+                  <div class="absolute inset-0 flex items-center justify-center">
+                    <div class="flex flex-col items-center gap-3">
+                      <svg class="animate-spin h-6 w-6 text-accent-cyan/60" viewBox="0 0 24 24">
+                        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" fill="none" opacity="0.25"/>
+                        <path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" opacity="0.75"/>
+                      </svg>
+                      <span class="text-xs text-gray-500">Loading usage data…</span>
+                    </div>
+                  </div>
+                </template>
                 <canvas id="tokenChart"></canvas>
               </div>
 
@@ -504,15 +514,30 @@ export function DashboardPage() {
               <div class="grid grid-cols-3 gap-4 mt-6 pt-5 border-t border-white/5">
                 <div class="text-center">
                   <p class="text-xs text-gray-500 mb-1">Requests</p>
-                  <p class="text-lg font-bold font-mono text-white" x-text="tokenSummary.requests.toLocaleString()"></p>
+                  <template x-if="tokenLoading && !tokenChart">
+                    <div class="h-7 w-16 mx-auto bg-surface-600 rounded animate-pulse"></div>
+                  </template>
+                  <template x-if="!tokenLoading || tokenChart">
+                    <p class="text-lg font-bold font-mono text-white" x-text="tokenSummary.requests.toLocaleString()"></p>
+                  </template>
                 </div>
                 <div class="text-center">
                   <p class="text-xs text-gray-500 mb-1">Input Tokens</p>
-                  <p class="text-lg font-bold font-mono text-white" x-text="tokenSummary.input.toLocaleString()"></p>
+                  <template x-if="tokenLoading && !tokenChart">
+                    <div class="h-7 w-20 mx-auto bg-surface-600 rounded animate-pulse"></div>
+                  </template>
+                  <template x-if="!tokenLoading || tokenChart">
+                    <p class="text-lg font-bold font-mono text-white" x-text="tokenSummary.input.toLocaleString()"></p>
+                  </template>
                 </div>
                 <div class="text-center">
                   <p class="text-xs text-gray-500 mb-1">Output Tokens</p>
-                  <p class="text-lg font-bold font-mono text-white" x-text="tokenSummary.output.toLocaleString()"></p>
+                  <template x-if="tokenLoading && !tokenChart">
+                    <div class="h-7 w-20 mx-auto bg-surface-600 rounded animate-pulse"></div>
+                  </template>
+                  <template x-if="!tokenLoading || tokenChart">
+                    <p class="text-lg font-bold font-mono text-white" x-text="tokenSummary.output.toLocaleString()"></p>
+                  </template>
                 </div>
               </div>
             </div>
@@ -574,7 +599,7 @@ export function DashboardPage() {
             keysLoading: false,
             now: Date.now(),
             newKeyName: '',
-            newKeyResult: null,
+            selectedKeyId: null,
             keyCreating: false,
             keyDeleting: null,
             keyRotating: null,
@@ -598,7 +623,16 @@ export function DashboardPage() {
 
             get baseUrl() { return location.origin; },
 
-            get activeKey() { return this.isAdmin ? (this.newKeyResult?.key || '<your-api-key>') : this.authKey; },
+            get activeKey() {
+              const sel = this.selectedKeyId && this.keys.find(k => k.id === this.selectedKeyId);
+              if (sel) return sel.key;
+              return this.isAdmin ? '<your-api-key>' : this.authKey;
+            },
+
+            truncateKey(key) {
+              if (!key || key.length <= 12) return key;
+              return key.slice(0, 4) + '\u2026' + key.slice(-4);
+            },
 
             timeAgo(dateStr) {
               if (!dateStr) return null;
@@ -803,12 +837,17 @@ export function DashboardPage() {
             async disconnectGithub() {
               if (!confirm('Disconnect GitHub account? You will need to reconnect to use Copilot API.')) return;
               try {
-                await fetch('/auth/github/disconnect', { method: 'POST', headers: this.authHeaders() });
-                this.githubConnected = false;
-                this.user = null;
-                this.usageData = null;
-                this.usageError = false;
-                this.usagePercent = 0;
+                const resp = await fetch('/auth/github/disconnect', { method: 'POST', headers: this.authHeaders() });
+                if (resp.status === 401) { this.kickToLogin(); return; }
+                if (resp.ok) {
+                  this.githubConnected = false;
+                  this.user = null;
+                  this.usageData = null;
+                  this.usageError = false;
+                  this.usagePercent = 0;
+                } else {
+                  alert('Failed to disconnect GitHub account');
+                }
               } catch (e) { console.error('disconnectGithub:', e); }
             },
 
@@ -819,7 +858,17 @@ export function DashboardPage() {
               try {
                 const resp = await fetch('/api/keys', { headers: this.authHeaders() });
                 if (resp.status === 401) { this.kickToLogin(); return; }
-                if (resp.ok) this.keys = await resp.json();
+                if (resp.ok) {
+                  this.keys = await resp.json();
+                  // Auto-select the only key for non-admin users
+                  if (!this.isAdmin && this.keys.length === 1 && !this.selectedKeyId) {
+                    this.selectedKeyId = this.keys[0].id;
+                  }
+                  // Clear stale selection if key no longer exists
+                  if (this.selectedKeyId && !this.keys.some(k => k.id === this.selectedKeyId)) {
+                    this.selectedKeyId = null;
+                  }
+                }
               } catch (e) { console.error('loadKeys:', e); }
               finally { this.keysLoading = false; }
             },
@@ -836,7 +885,8 @@ export function DashboardPage() {
                 });
                 if (resp.status === 401) { this.kickToLogin(); return; }
                 if (resp.ok) {
-                  this.newKeyResult = await resp.json();
+                  const created = await resp.json();
+                  this.selectedKeyId = created.id;
                   this.newKeyName = '';
                   await this.loadKeys();
                 } else {
@@ -850,9 +900,13 @@ export function DashboardPage() {
               if (!confirm('Delete key "' + name + '"? This cannot be undone.')) return;
               this.keyDeleting = id;
               try {
-                await fetch('/api/keys/' + id, { method: 'DELETE', headers: this.authHeaders() });
-                if (this.newKeyResult && this.newKeyResult.id === id) this.newKeyResult = null;
-                await this.loadKeys();
+                const resp = await fetch('/api/keys/' + id, { method: 'DELETE', headers: this.authHeaders() });
+                if (resp.status === 401) { this.kickToLogin(); return; }
+                if (resp.ok) {
+                  await this.loadKeys();
+                } else {
+                  alert((await resp.json()).error || 'Failed to delete key');
+                }
               } catch (e) { console.error('deleteKey:', e); }
               finally { this.keyDeleting = null; }
             },
@@ -864,7 +918,7 @@ export function DashboardPage() {
                 const resp = await fetch('/api/keys/' + id + '/rotate', { method: 'POST', headers: this.authHeaders() });
                 if (resp.status === 401) { this.kickToLogin(); return; }
                 if (resp.ok) {
-                  this.newKeyResult = await resp.json();
+                  this.selectedKeyId = id;
                   await this.loadKeys();
                 } else {
                   alert((await resp.json()).error || 'Failed to rotate key');
