@@ -298,11 +298,17 @@ function mapResponsesStopReason(response: ResponsesResult): AnthropicResponse["s
 // ── Request: Responses → Anthropic (reverse translation) ──
 
 export function translateResponsesToAnthropicPayload(payload: ResponsesPayload): AnthropicMessagesPayload {
+  const { messages, systemParts } = responsesInputToAnthropicMessages(payload.input);
+
+  const allSystemParts: string[] = [];
+  if (payload.instructions) allSystemParts.push(payload.instructions);
+  allSystemParts.push(...systemParts);
+
   return {
     model: payload.model,
-    messages: responsesInputToAnthropicMessages(payload.input),
+    messages,
     max_tokens: payload.max_output_tokens ?? 8192,
-    system: payload.instructions ?? undefined,
+    system: allSystemParts.length > 0 ? allSystemParts.join("\n\n") : undefined,
     temperature: payload.temperature ?? undefined,
     top_p: payload.top_p ?? undefined,
     stream: payload.stream ?? undefined,
@@ -312,17 +318,26 @@ export function translateResponsesToAnthropicPayload(payload: ResponsesPayload):
   };
 }
 
-function responsesInputToAnthropicMessages(input: string | ResponseInputItem[]): AnthropicMessage[] {
+function responsesInputToAnthropicMessages(input: string | ResponseInputItem[]): { messages: AnthropicMessage[]; systemParts: string[] } {
   if (typeof input === "string") {
-    return [{ role: "user" as const, content: input }];
+    return { messages: [{ role: "user" as const, content: input }], systemParts: [] };
   }
 
   const messages: AnthropicMessage[] = [];
+  const systemParts: string[] = [];
 
   for (const item of input) {
     switch (item.type) {
       case "message": {
-        if (item.role === "system" || item.role === "developer") continue;
+        if (item.role === "system" || item.role === "developer") {
+          const text = typeof item.content === "string"
+            ? item.content
+            : Array.isArray(item.content)
+              ? item.content.map((c) => "text" in c ? c.text : "").join("")
+              : "";
+          if (text) systemParts.push(text);
+          continue;
+        }
         if (item.role === "user") messages.push(reverseUserMessage(item));
         else if (item.role === "assistant") messages.push(reverseAssistantMessage(item));
         break;
@@ -357,7 +372,7 @@ function responsesInputToAnthropicMessages(input: string | ResponseInputItem[]):
     }
   }
 
-  return messages;
+  return { messages, systemParts };
 }
 
 function reverseUserMessage(msg: ResponseInputMessage): AnthropicUserMessage {

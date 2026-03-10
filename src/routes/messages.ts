@@ -68,6 +68,30 @@ function isContextWindowError(text: string): boolean {
     text.includes("context_length_exceeded");
 }
 
+/** Copilot rejects requests containing this string in system prompts */
+const RESERVED_KEYWORD = "x-anthropic-billing-header";
+
+function stripReservedKeywords(payload: AnthropicMessagesPayload): void {
+  if (typeof payload.system === "string") {
+    payload.system = payload.system.replaceAll(RESERVED_KEYWORD, "");
+  } else if (Array.isArray(payload.system)) {
+    for (const block of payload.system) {
+      block.text = block.text.replaceAll(RESERVED_KEYWORD, "");
+    }
+  }
+  for (const msg of payload.messages) {
+    if (typeof msg.content === "string") {
+      msg.content = msg.content.replaceAll(RESERVED_KEYWORD, "");
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if ("text" in block && typeof block.text === "string") {
+          block.text = block.text.replaceAll(RESERVED_KEYWORD, "");
+        }
+      }
+    }
+  }
+}
+
 /** Anthropic-compatible error that triggers compact in Claude Code */
 function contextWindowErrorResponse(c: Context) {
   return c.json({
@@ -81,13 +105,13 @@ function contextWindowErrorResponse(c: Context) {
 
 function copilotErrorResponse(c: Context, status: number, text: string) {
   return c.json(
-    { error: { type: "api_error", message: `Copilot API error: ${status} ${text}` } },
+    { type: "error", error: { type: "api_error", message: `Copilot API error: ${status} ${text}` } },
     status as 400 | 401 | 403 | 404 | 429 | 500 | 502 | 503,
   );
 }
 
 function noBodyResponse(c: Context) {
-  return c.json({ error: { type: "api_error", message: "No response body from upstream" } }, 502);
+  return c.json({ type: "error", error: { type: "api_error", message: "No response body from upstream" } }, 502);
 }
 
 export const messages = async (c: Context) => {
@@ -101,6 +125,8 @@ export const messages = async (c: Context) => {
       payload.tools = payload.tools.filter((t) => (t as any).type !== "web_search");
       if (payload.tools.length === 0) delete payload.tools;
     }
+
+    stripReservedKeywords(payload);
 
     const vision = hasVision(payload);
     const initiator = getInitiator(payload);

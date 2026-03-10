@@ -19,15 +19,16 @@ import type {
 import { decodeSignature } from "./utils.ts";
 
 type OutputBlockInfo =
-  | { type: "thinking"; outputIndex: number; thinkingText: string; signature: string }
-  | { type: "text"; outputIndex: number; contentIndex: number }
-  | { type: "tool_use"; outputIndex: number; toolCallId: string; toolName: string; toolArguments: string };
+  | { type: "thinking"; outputIndex: number; itemId: string; thinkingText: string; signature: string }
+  | { type: "text"; outputIndex: number; itemId: string; contentIndex: number }
+  | { type: "tool_use"; outputIndex: number; itemId: string; toolCallId: string; toolName: string; toolArguments: string };
 
 export interface AnthropicToResponsesStreamState {
   responseId: string;
   model: string;
   responseCreated: boolean;
   outputIndex: number;
+  sequenceNumber: number;
   blockMap: Map<number, OutputBlockInfo>;
   accumulatedText: string;
   completedItems: ResponseOutputItem[];
@@ -46,6 +47,7 @@ export function createAnthropicToResponsesStreamState(
     model,
     responseCreated: false,
     outputIndex: 0,
+    sequenceNumber: 0,
     blockMap: new Map(),
     accumulatedText: "",
     completedItems: [],
@@ -54,6 +56,10 @@ export function createAnthropicToResponsesStreamState(
     outputTokens: 0,
     cacheReadInputTokens: undefined,
   };
+}
+
+function seq(state: AnthropicToResponsesStreamState, events: ResponseStreamEvent[]): ResponseStreamEvent[] {
+  return events.map((e) => ({ ...e, sequence_number: state.sequenceNumber++ }));
 }
 
 export function translateAnthropicEventToResponsesEvents(
@@ -69,7 +75,7 @@ export function translateAnthropicEventToResponsesEvents(
     case "content_block_stop": return handleContentBlockStop(event, state);
     case "message_delta": return handleMessageDelta(event, state);
     case "message_stop": return handleMessageStop(state);
-    case "ping": return [{ type: "ping" }];
+    case "ping": return seq(state, [{ type: "ping" }]);
     case "error": return handleError(event, state);
     default: return [];
   }
@@ -83,10 +89,11 @@ function handleMessageStart(event: AnthropicMessageStartEvent, state: AnthropicT
   if (state.responseCreated) return [];
   state.responseCreated = true;
 
-  return [{
-    type: "response.created",
-    response: buildResult(state, "in_progress"),
-  }];
+  const response = buildResult(state, "in_progress");
+  return seq(state, [
+    { type: "response.created", response },
+    { type: "response.in_progress", response },
+  ]);
 }
 
 function handleContentBlockStart(event: AnthropicContentBlockStartEvent, state: AnthropicToResponsesStreamState): ResponseStreamEvent[] {
@@ -95,30 +102,32 @@ function handleContentBlockStart(event: AnthropicContentBlockStartEvent, state: 
   const outputIdx = state.outputIndex++;
 
   if (contentBlock.type === "thinking") {
-    state.blockMap.set(index, { type: "thinking", outputIndex: outputIdx, thinkingText: "", signature: "" });
-    return [{
-      type: "response.output_item.added",
-      output_index: outputIdx,
-      item: { type: "reasoning", id: `rs_${outputIdx}`, summary: [], encrypted_content: undefined } as ResponseOutputReasoning,
-    }];
+    const itemId = `rs_${outputIdx}`;
+    state.blockMap.set(index, { type: "thinking", outputIndex: outputIdx, itemId, thinkingText: "", signature: "" });
+    const item: ResponseOutputReasoning = { type: "reasoning", id: itemId, summary: [], encrypted_content: undefined };
+    return seq(state, [
+      { type: "response.output_item.added", output_index: outputIdx, item },
+      { type: "response.reasoning_summary_part.added", item_id: itemId, output_index: outputIdx, summary_index: 0, part: { type: "summary_text", text: "" } },
+    ]);
   }
 
   if (contentBlock.type === "text") {
-    state.blockMap.set(index, { type: "text", outputIndex: outputIdx, contentIndex: 0 });
-    return [{
-      type: "response.output_item.added",
-      output_index: outputIdx,
-      item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "" }] } as ResponseOutputMessage,
-    }];
+    const itemId = `msg_${outputIdx}`;
+    state.blockMap.set(index, { type: "text", outputIndex: outputIdx, itemId, contentIndex: 0 });
+    const item: ResponseOutputMessage = { type: "message", role: "assistant", content: [{ type: "output_text", text: "" }] };
+    return seq(state, [
+      { type: "response.output_item.added", output_index: outputIdx, item },
+      { type: "response.content_part.added", item_id: itemId, output_index: outputIdx, content_index: 0, part: { type: "output_text", text: "" } },
+    ]);
   }
 
   if (contentBlock.type === "tool_use") {
-    state.blockMap.set(index, { type: "tool_use", outputIndex: outputIdx, toolCallId: contentBlock.id, toolName: contentBlock.name, toolArguments: "" });
-    return [{
-      type: "response.output_item.added",
-      output_index: outputIdx,
-      item: { type: "function_call", call_id: contentBlock.id, name: contentBlock.name, arguments: "", status: "in_progress" } as ResponseOutputFunctionCall,
-    }];
+    const itemId = `fc_${outputIdx}`;
+    state.blockMap.set(index, { type: "tool_use", outputIndex: outputIdx, itemId, toolCallId: contentBlock.id, toolName: contentBlock.name, toolArguments: "" });
+    const item: ResponseOutputFunctionCall = { type: "function_call", call_id: contentBlock.id, name: contentBlock.name, arguments: "", status: "in_progress" };
+    return seq(state, [
+      { type: "response.output_item.added", output_index: outputIdx, item },
+    ]);
   }
 
   return [];
@@ -131,36 +140,39 @@ function handleContentBlockDelta(event: AnthropicContentBlockDeltaEvent, state: 
 
   if (delta.type === "thinking_delta" && info.type === "thinking") {
     info.thinkingText += delta.thinking;
-    return [{
+    return seq(state, [{
       type: "response.reasoning_summary_text.delta",
+      item_id: info.itemId,
       output_index: info.outputIndex,
       summary_index: 0,
       delta: delta.thinking,
-    }];
+    }]);
   }
 
   if (delta.type === "signature_delta" && info.type === "thinking") {
     info.signature += delta.signature;
-    return []; // signature is sent with output_item.done, not streamed
+    return [];
   }
 
   if (delta.type === "text_delta" && info.type === "text") {
     state.accumulatedText += delta.text;
-    return [{
+    return seq(state, [{
       type: "response.output_text.delta",
+      item_id: info.itemId,
       output_index: info.outputIndex,
       content_index: info.contentIndex,
       delta: delta.text,
-    }];
+    }]);
   }
 
   if (delta.type === "input_json_delta" && info.type === "tool_use") {
     info.toolArguments += delta.partial_json;
-    return [{
+    return seq(state, [{
       type: "response.function_call_arguments.delta",
+      item_id: info.itemId,
       output_index: info.outputIndex,
       delta: delta.partial_json,
-    }];
+    }]);
   }
 
   return [];
@@ -176,30 +188,34 @@ function handleContentBlockStop(event: AnthropicContentBlockStopEvent, state: An
   if (info.type === "thinking") {
     const { encryptedContent, reasoningId } = decodeSignature(info.signature);
     const summaryText = info.thinkingText === THINKING_PLACEHOLDER ? "" : info.thinkingText;
+    const finalItemId = reasoningId ?? info.itemId;
 
     if (summaryText) {
-      events.push({ type: "response.reasoning_summary_text.done", output_index: info.outputIndex, summary_index: 0, text: summaryText });
+      events.push({ type: "response.reasoning_summary_text.done", item_id: finalItemId, output_index: info.outputIndex, summary_index: 0, text: summaryText });
     }
+    events.push({ type: "response.reasoning_summary_part.done", item_id: finalItemId, output_index: info.outputIndex, summary_index: 0, part: { type: "summary_text", text: summaryText } });
     const item: ResponseOutputReasoning = {
-      type: "reasoning", id: reasoningId ?? `rs_${info.outputIndex}`,
+      type: "reasoning", id: finalItemId,
       summary: summaryText ? [{ type: "summary_text", text: summaryText }] : [],
       encrypted_content: encryptedContent || undefined,
     };
     state.completedItems.push(item);
     events.push({ type: "response.output_item.done", output_index: info.outputIndex, item });
   } else if (info.type === "text") {
-    events.push({ type: "response.output_text.done", output_index: info.outputIndex, content_index: info.contentIndex, text: state.accumulatedText });
-    const item: ResponseOutputMessage = { type: "message", role: "assistant", content: [{ type: "output_text", text: state.accumulatedText }] };
+    events.push({ type: "response.output_text.done", item_id: info.itemId, output_index: info.outputIndex, content_index: info.contentIndex, text: state.accumulatedText });
+    const part = { type: "output_text" as const, text: state.accumulatedText };
+    events.push({ type: "response.content_part.done", item_id: info.itemId, output_index: info.outputIndex, content_index: info.contentIndex, part });
+    const item: ResponseOutputMessage = { type: "message", role: "assistant", content: [part] };
     state.completedItems.push(item);
     events.push({ type: "response.output_item.done", output_index: info.outputIndex, item });
   } else if (info.type === "tool_use") {
-    events.push({ type: "response.function_call_arguments.done", output_index: info.outputIndex, arguments: info.toolArguments });
+    events.push({ type: "response.function_call_arguments.done", item_id: info.itemId, output_index: info.outputIndex, arguments: info.toolArguments });
     const item: ResponseOutputFunctionCall = { type: "function_call", call_id: info.toolCallId, name: info.toolName, arguments: info.toolArguments, status: "completed" };
     state.completedItems.push(item);
     events.push({ type: "response.output_item.done", output_index: info.outputIndex, item });
   }
 
-  return events;
+  return seq(state, events);
 }
 
 function handleMessageDelta(event: AnthropicMessageDeltaEvent, state: AnthropicToResponsesStreamState): ResponseStreamEvent[] {
@@ -212,12 +228,12 @@ function handleMessageDelta(event: AnthropicMessageDeltaEvent, state: AnthropicT
 function handleMessageStop(state: AnthropicToResponsesStreamState): ResponseStreamEvent[] {
   if (state.completed) return [];
   state.completed = true;
-  return [{ type: "response.completed", response: buildResult(state, "completed") }];
+  return seq(state, [{ type: "response.completed", response: buildResult(state, "completed") }]);
 }
 
 function handleError(event: AnthropicErrorEvent, state: AnthropicToResponsesStreamState): ResponseStreamEvent[] {
   state.completed = true;
-  return [{ type: "error", message: event.error?.message ?? "An unexpected error occurred.", code: event.error?.type }];
+  return seq(state, [{ type: "error", message: event.error?.message ?? "An unexpected error occurred.", code: event.error?.type }]);
 }
 
 function buildResult(state: AnthropicToResponsesStreamState, status: ResponsesResult["status"]): ResponsesResult {
