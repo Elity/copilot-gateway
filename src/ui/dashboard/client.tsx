@@ -34,6 +34,12 @@ export function dashboardAssets() {
       return ta !== tb ? tb - ta : b.localeCompare(a);
     }
 
+    function sortClaudeSonnet(a, b) {
+      const da = Math.abs(claudeTier(a) - CLAUDE_TIER.sonnet);
+      const db = Math.abs(claudeTier(b) - CLAUDE_TIER.sonnet);
+      return da !== db ? da - db : b.localeCompare(a);
+    }
+
     function sortCodex(a, b) {
       const am = a.includes('mini') ? 1 : 0;
       const bm = b.includes('mini') ? 1 : 0;
@@ -62,8 +68,11 @@ export function dashboardAssets() {
       copied: false,
       modelsLoaded: false,
       claudeModelsBig: [],
+      claudeModelsSonnet: [],
       claudeModelsSmall: [],
+      claudeContextMap: {},
       claudeModel: '',
+      claudeSonnetModel: '',
       claudeSmallModel: '',
       codexModels: [],
       codexModel: '',
@@ -116,11 +125,22 @@ export function dashboardAssets() {
         },
 
         claudeCodeSnippet() {
+          // Claude Code uses a client-side [1m] suffix to enable 1M context window.
+          // CC strips it before sending the model name to the API via
+          // normalizeModelStringForAPI() (src/utils/model/model.ts), so the
+          // gateway never sees it. The suffix triggers two client-side effects:
+          //   1. getContextWindowForModel() returns 1_000_000 (src/utils/context.ts)
+          //   2. "context-1m-2025-08-07" beta header is added (src/utils/betas.ts)
+          const addCtx = (id) => {
+            const p = this.claudeContextMap[id];
+            return p >= 1000000 ? id + '[1m]' : id;
+          };
           const lines = [
             'export ANTHROPIC_BASE_URL=' + this.baseUrl,
             'export ANTHROPIC_AUTH_TOKEN=' + this.activeKey,
-            'export ANTHROPIC_MODEL=' + this.claudeModel,
-            'export ANTHROPIC_SMALL_FAST_MODEL=' + this.claudeSmallModel,
+            'export ANTHROPIC_MODEL=' + addCtx(this.claudeModel),
+            'export ANTHROPIC_DEFAULT_SONNET_MODEL=' + addCtx(this.claudeSonnetModel),
+            'export ANTHROPIC_DEFAULT_HAIKU_MODEL=' + this.claudeSmallModel,
           ];
           return lines.join('\\n');
         },
@@ -212,13 +232,22 @@ export function dashboardAssets() {
             if (!resp.ok) return;
             const { data } = await resp.json();
 
-            const claudeAll = data
-              .filter((m) => m.id.startsWith('claude-') && m.supported_endpoints?.includes('/v1/messages'))
-              .map((m) => m.id);
+            const claudeFiltered = data
+              .filter((m) => m.id.startsWith('claude-') && m.supported_endpoints?.includes('/v1/messages'));
+
+              const claudeAll = claudeFiltered.map((m) => m.id);
+              this.claudeContextMap = {};
+              for (const m of claudeFiltered) {
+                const limits = m.capabilities?.limits;
+                const total = (limits?.max_prompt_tokens || 0) + (limits?.max_output_tokens || 0);
+                if (total) this.claudeContextMap[m.id] = total;
+              }
 
               this.claudeModelsBig = [...claudeAll].sort(sortClaudeBig);
+              this.claudeModelsSonnet = [...claudeAll].sort(sortClaudeSonnet);
               this.claudeModelsSmall = [...claudeAll].sort(sortClaudeSmall);
               this.claudeModel = this.claudeModelsBig[0] || '';
+              this.claudeSonnetModel = this.claudeModelsSonnet[0] || '';
               this.claudeSmallModel = this.claudeModelsSmall[0] || '';
 
               this.codexModels = data

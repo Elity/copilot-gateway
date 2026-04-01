@@ -810,7 +810,18 @@ export function renderKeysTab() {
                   </select>
                 </div>
                 <div class="flex items-center gap-2">
-                  <label class="text-xs text-gray-500">Small/fast:</label>
+                  <label class="text-xs text-gray-500">Sonnet:</label>
+                  <select
+                    x-model="claudeSonnetModel"
+                    class="text-xs font-mono bg-surface-800 text-gray-300 border border-white/10 rounded-lg px-2 py-1.5 outline-none focus:border-accent-cyan/50 cursor-pointer"
+                  >
+                    <template x-for="m in claudeModelsSonnet" :key="m">
+                      <option :value="m" x-text="m"></option>
+                    </template>
+                  </select>
+                </div>
+                <div class="flex items-center gap-2">
+                  <label class="text-xs text-gray-500">Haiku:</label>
                   <select
                     x-model="claudeSmallModel"
                     class="text-xs font-mono bg-surface-800 text-gray-300 border border-white/10 rounded-lg px-2 py-1.5 outline-none focus:border-accent-cyan/50 cursor-pointer"
