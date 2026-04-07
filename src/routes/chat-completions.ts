@@ -6,6 +6,11 @@ import { copilotFetch } from "../lib/copilot.ts";
 import { getGithubCredentials } from "../lib/github.ts";
 import { findModel } from "../lib/models-cache.ts";
 import { parseSSEStream } from "../lib/sse.ts";
+import {
+  isSSEResponse,
+  reassembleAnthropicSSE,
+  reassembleChatCompletionsSSE,
+} from "../lib/sse-reassemble.ts";
 import type {
   AnthropicResponse,
   AnthropicStreamEventData,
@@ -172,11 +177,15 @@ async function handleViaMessagesApi(
     loadRemoteImage: fetchRemoteImage,
   });
   const vision = hasVision(payload as unknown as Record<string, unknown>);
+  const wantsStream = !!payload.stream;
 
   const extraHeaders: Record<string, string> = {};
   if (anthropicPayload.thinking?.budget_tokens) {
     extraHeaders["anthropic-beta"] = INTERLEAVED_THINKING_BETA;
   }
+
+  // Always stream upstream to avoid blocking on large responses
+  anthropicPayload.stream = true;
 
   const resp = await copilotFetch(
     "/v1/messages",
@@ -195,8 +204,13 @@ async function handleViaMessagesApi(
   }
 
   // Non-streaming
-  if (!payload.stream) {
-    const anthropicResponse = await resp.json() as AnthropicResponse;
+  if (!wantsStream) {
+    let anthropicResponse: AnthropicResponse;
+    if (resp.body && isSSEResponse(resp)) {
+      anthropicResponse = await reassembleAnthropicSSE(resp.body);
+    } else {
+      anthropicResponse = await resp.json() as AnthropicResponse;
+    }
     return c.json(translateMessagesToChatCompletion(anthropicResponse));
   }
 
@@ -239,6 +253,10 @@ async function handleViaCompletionsApi(
   const vision = hasVision(body);
   const needsFix = (typeof body.model === "string") &&
     body.model.startsWith("claude");
+  const wantsStream = !!body.stream;
+
+  // Always stream upstream to avoid blocking on large responses
+  body.stream = true;
 
   const resp = await copilotFetch(
     "/chat/completions",
@@ -250,15 +268,29 @@ async function handleViaCompletionsApi(
 
   const contentType = resp.headers.get("content-type") ?? "application/json";
 
-  if (contentType.includes("text/event-stream")) {
-    const stream = needsFix && resp.body ? fixStream(resp.body) : resp.body;
-    return new Response(stream, {
-      status: resp.status,
-      headers: {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache",
-      },
-    });
+  if (wantsStream) {
+    if (contentType.includes("text/event-stream")) {
+      const stream = needsFix && resp.body ? fixStream(resp.body) : resp.body;
+      return new Response(stream, {
+        status: resp.status,
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        },
+      });
+    }
+
+    // Upstream returned JSON even though we asked for streaming — proxy as-is
+    return proxyJsonResponse(resp);
+  }
+
+  // Client wants non-streaming response
+  if (contentType.includes("text/event-stream") && resp.body) {
+    const data = await reassembleChatCompletionsSSE(resp.body);
+    if (needsFix) {
+      return c.json(mergeChoices(data), resp.status as 200);
+    }
+    return c.json(data, resp.status as 200);
   }
 
   if (needsFix && resp.status >= 200 && resp.status < 300) {

@@ -30,6 +30,12 @@ import type {
 } from "../lib/responses-types.ts";
 import { proxySSE } from "../lib/sse.ts";
 import {
+  isSSEResponse,
+  reassembleAnthropicSSE,
+  reassembleChatCompletionsSSE,
+  reassembleResponsesSSE,
+} from "../lib/sse-reassemble.ts";
+import {
   anthropicApiErrorResponse,
   anthropicCopilotApiErrorResponse,
   getErrorMessage,
@@ -242,6 +248,10 @@ async function forwardMessages(
   fetchOptions: CopilotFetchOptions,
 ): Promise<Response> {
   const { service_tier: _, ...cleanPayload } = payload;
+  const wantsStream = !!payload.stream;
+
+  // Always stream upstream to avoid blocking on large responses
+  cleanPayload.stream = true;
 
   const resp = await copilotFetch(
     "/v1/messages",
@@ -262,8 +272,11 @@ async function forwardMessages(
       );
   }
 
-  if (!payload.stream) {
-    return c.json(await resp.json());
+  if (!wantsStream) {
+    if (!resp.body || !isSSEResponse(resp)) {
+      return c.json(await resp.json());
+    }
+    return c.json(await reassembleAnthropicSSE(resp.body));
   }
 
   if (!resp.body) return noUpstreamBodyAnthropicErrorResponse(c);
@@ -287,6 +300,11 @@ async function handleTranslated(
   };
 
   const openAIPayload = translateToOpenAI(payload);
+  const wantsStream = !!payload.stream;
+
+  // Always stream upstream to avoid blocking on large responses
+  openAIPayload.stream = true;
+
   const resp = await copilotFetch(
     "/chat/completions",
     { method: "POST", body: JSON.stringify(openAIPayload) },
@@ -306,10 +324,14 @@ async function handleTranslated(
       );
   }
 
-  if (!payload.stream) {
-    return c.json(
-      translateToAnthropic(await resp.json() as ChatCompletionResponse),
-    );
+  if (!wantsStream) {
+    let chatResp: ChatCompletionResponse;
+    if (resp.body && isSSEResponse(resp)) {
+      chatResp = await reassembleChatCompletionsSSE(resp.body);
+    } else {
+      chatResp = await resp.json() as ChatCompletionResponse;
+    }
+    return c.json(translateToAnthropic(chatResp));
   }
 
   if (!resp.body) return noUpstreamBodyAnthropicErrorResponse(c);
@@ -345,6 +367,11 @@ async function handleWithResponses(
   opts: { vision: boolean; initiator: "user" | "agent" },
 ): Promise<Response> {
   const responsesPayload = translateAnthropicToResponses(payload);
+  const wantsStream = !!payload.stream;
+
+  // Always stream upstream to avoid blocking on large responses
+  responsesPayload.stream = true;
+
   const resp = await copilotFetch(
     "/responses",
     { method: "POST", body: JSON.stringify(responsesPayload) },
@@ -364,10 +391,14 @@ async function handleWithResponses(
       );
   }
 
-  if (!payload.stream) {
-    return c.json(
-      translateResponsesToAnthropic(await resp.json() as ResponsesResult),
-    );
+  if (!wantsStream) {
+    let result: ResponsesResult;
+    if (resp.body && isSSEResponse(resp)) {
+      result = await reassembleResponsesSSE(resp.body);
+    } else {
+      result = await resp.json() as ResponsesResult;
+    }
+    return c.json(translateResponsesToAnthropic(result));
   }
 
   if (!resp.body) return noUpstreamBodyAnthropicErrorResponse(c);

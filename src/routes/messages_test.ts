@@ -37,16 +37,38 @@ Deno.test("/v1/messages uses native endpoint and applies native request workarou
     if (url.pathname === "/v1/messages") {
       upstreamBody = JSON.parse(await request.text());
       upstreamBeta = request.headers.get("anthropic-beta");
-      return jsonResponse({
-        id: "msg_native",
-        type: "message",
-        role: "assistant",
-        model: "claude-native",
-        content: [{ type: "text", text: "ok" }],
-        stop_reason: "end_turn",
-        stop_sequence: null,
-        usage: { input_tokens: 10, output_tokens: 4 },
-      });
+      return sseResponse([
+        {
+          event: "message_start",
+          data: {
+            type: "message_start",
+            message: {
+              id: "msg_native",
+              type: "message",
+              role: "assistant",
+              content: [],
+              model: "claude-native",
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 10, output_tokens: 0 },
+            },
+          },
+        },
+        {
+          event: "content_block_start",
+          data: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        },
+        {
+          event: "content_block_delta",
+          data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+        },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        {
+          event: "message_delta",
+          data: { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } },
+        },
+        { event: "message_stop", data: { type: "message_stop" } },
+      ]);
     }
 
     throw new Error(`Unhandled fetch ${request.url}`);
@@ -95,9 +117,11 @@ Deno.test("/v1/messages uses native endpoint and applies native request workarou
     assertEquals(response.status, 200);
     const body = await response.json();
     assertEquals(body.id, "msg_native");
+    assertEquals(body.content[0].text, "ok");
   });
 
   assertExists(upstreamBody);
+  assertEquals(upstreamBody!.stream, true);
   assertEquals(upstreamBody!.system, "system  note");
   assertFalse("service_tier" in upstreamBody!);
   assertEquals(
@@ -159,16 +183,38 @@ Deno.test("/v1/messages keeps caller thinking and tool_choice unchanged on nativ
     if (url.pathname === "/v1/messages") {
       upstreamBody = JSON.parse(await request.text());
       upstreamBeta = request.headers.get("anthropic-beta");
-      return jsonResponse({
-        id: "msg_native",
-        type: "message",
-        role: "assistant",
-        model: "claude-adaptive",
-        content: [{ type: "text", text: "ok" }],
-        stop_reason: "end_turn",
-        stop_sequence: null,
-        usage: { input_tokens: 10, output_tokens: 4 },
-      });
+      return sseResponse([
+        {
+          event: "message_start",
+          data: {
+            type: "message_start",
+            message: {
+              id: "msg_native",
+              type: "message",
+              role: "assistant",
+              content: [],
+              model: "claude-adaptive",
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 10, output_tokens: 0 },
+            },
+          },
+        },
+        {
+          event: "content_block_start",
+          data: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        },
+        {
+          event: "content_block_delta",
+          data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+        },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        {
+          event: "message_delta",
+          data: { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } },
+        },
+        { event: "message_stop", data: { type: "message_stop" } },
+      ]);
     }
 
     throw new Error(`Unhandled fetch ${request.url}`);
@@ -201,6 +247,7 @@ Deno.test("/v1/messages keeps caller thinking and tool_choice unchanged on nativ
   });
 
   assertExists(upstreamBody);
+  assertEquals(upstreamBody!.stream, true);
   assertFalse("thinking" in upstreamBody!);
   assertFalse("output_config" in upstreamBody!);
   assertEquals(
@@ -307,16 +354,38 @@ Deno.test("/v1/messages forwards Anthropic tool strict field on native messages"
     }
     if (url.pathname === "/v1/messages") {
       upstreamBody = JSON.parse(await request.text());
-      return jsonResponse({
-        id: "msg_native",
-        type: "message",
-        role: "assistant",
-        model: "claude-native",
-        content: [{ type: "text", text: "ok" }],
-        stop_reason: "end_turn",
-        stop_sequence: null,
-        usage: { input_tokens: 10, output_tokens: 4 },
-      });
+      return sseResponse([
+        {
+          event: "message_start",
+          data: {
+            type: "message_start",
+            message: {
+              id: "msg_native",
+              type: "message",
+              role: "assistant",
+              content: [],
+              model: "claude-native",
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 10, output_tokens: 0 },
+            },
+          },
+        },
+        {
+          event: "content_block_start",
+          data: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        },
+        {
+          event: "content_block_delta",
+          data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+        },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        {
+          event: "message_delta",
+          data: { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } },
+        },
+        { event: "message_stop", data: { type: "message_stop" } },
+      ]);
     }
 
     throw new Error(`Unhandled fetch ${request.url}`);
@@ -344,6 +413,7 @@ Deno.test("/v1/messages forwards Anthropic tool strict field on native messages"
   });
 
   assertExists(upstreamBody);
+  assertEquals(upstreamBody!.stream, true);
   assertEquals(
     (upstreamBody!.tools as Array<Record<string, unknown>>)[0].strict,
     true,
@@ -378,16 +448,38 @@ Deno.test("/v1/messages keeps strict Anthropic tools on native messages when bot
     }
     if (url.pathname === "/v1/messages") {
       upstreamBody = JSON.parse(await request.text());
-      return jsonResponse({
-        id: "msg_dual",
-        type: "message",
-        role: "assistant",
-        model: "claude-dual-endpoint",
-        content: [{ type: "text", text: "ok" }],
-        stop_reason: "end_turn",
-        stop_sequence: null,
-        usage: { input_tokens: 10, output_tokens: 4 },
-      });
+      return sseResponse([
+        {
+          event: "message_start",
+          data: {
+            type: "message_start",
+            message: {
+              id: "msg_dual",
+              type: "message",
+              role: "assistant",
+              content: [],
+              model: "claude-dual-endpoint",
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 10, output_tokens: 0 },
+            },
+          },
+        },
+        {
+          event: "content_block_start",
+          data: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        },
+        {
+          event: "content_block_delta",
+          data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+        },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        {
+          event: "message_delta",
+          data: { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } },
+        },
+        { event: "message_stop", data: { type: "message_stop" } },
+      ]);
     }
     if (url.pathname === "/chat/completions") {
       throw new Error(
@@ -423,6 +515,7 @@ Deno.test("/v1/messages keeps strict Anthropic tools on native messages when bot
   });
 
   assertExists(upstreamBody);
+  assertEquals(upstreamBody!.stream, true);
   assertEquals(
     (upstreamBody!.tools as Array<Record<string, unknown>>)[0].strict,
     true,
@@ -454,32 +547,38 @@ Deno.test("/v1/messages falls back to chat completions and translates both direc
     }
     if (url.pathname === "/chat/completions") {
       upstreamBody = JSON.parse(await request.text());
-      return jsonResponse({
-        id: "chatcmpl_test123",
-        object: "chat.completion",
-        created: 1,
-        model: "gpt-chat-only",
-        choices: [{
-          index: 0,
-          finish_reason: "tool_calls",
-          message: {
-            role: "assistant",
-            content: "Need a tool",
-            reasoning_text: "thinking",
-            reasoning_opaque: "opaque",
-            tool_calls: [{
-              id: "call_1",
-              type: "function",
-              function: { name: "lookup", arguments: '{"city":"Tokyo"}' },
+      return sseResponse([
+        {
+          data: {
+            id: "chatcmpl_test123",
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "gpt-chat-only",
+            choices: [{
+              index: 0,
+              delta: {
+                role: "assistant",
+                content: "Need a tool",
+                reasoning_text: "thinking",
+                reasoning_opaque: "opaque",
+                tool_calls: [{
+                  index: 0,
+                  id: "call_1",
+                  type: "function",
+                  function: { name: "lookup", arguments: '{"city":"Tokyo"}' },
+                }],
+              },
+              finish_reason: "tool_calls",
             }],
+            usage: {
+              prompt_tokens: 40,
+              completion_tokens: 8,
+              prompt_tokens_details: { cached_tokens: 5 },
+            },
           },
-        }],
-        usage: {
-          prompt_tokens: 40,
-          completion_tokens: 8,
-          prompt_tokens_details: { cached_tokens: 5 },
         },
-      });
+        { data: "[DONE]" },
+      ]);
     }
 
     throw new Error(`Unhandled fetch ${request.url}`);
@@ -517,6 +616,7 @@ Deno.test("/v1/messages falls back to chat completions and translates both direc
   });
 
   assertExists(upstreamBody);
+  assertEquals(upstreamBody!.stream, true);
   const messages = upstreamBody!.messages as Array<Record<string, unknown>>;
   assertEquals(messages[0].role, "system");
   assertEquals(messages[1].role, "user");
@@ -584,7 +684,15 @@ Deno.test("/v1/messages falls back to responses and preserves reasoning round-tr
     }
     if (url.pathname === "/responses") {
       upstreamBody = JSON.parse(await request.text());
-      return jsonResponse(responsesResult);
+      return sseResponse([
+        {
+          event: "response.completed",
+          data: {
+            type: "response.completed",
+            response: responsesResult,
+          },
+        },
+      ]);
     }
 
     throw new Error(`Unhandled fetch ${request.url}`);
@@ -621,6 +729,7 @@ Deno.test("/v1/messages falls back to responses and preserves reasoning round-tr
   });
 
   assertExists(upstreamBody);
+  assertEquals(upstreamBody!.stream, true);
   assertEquals(upstreamBody!.instructions, "system instructions");
   assertEquals(upstreamBody!.temperature, 1);
   assertEquals(upstreamBody!.max_output_tokens, 12800);

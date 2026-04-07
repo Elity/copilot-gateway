@@ -15,6 +15,11 @@ import {
 } from "../lib/translate/anthropic-to-responses-stream.ts";
 import { proxySSE } from "../lib/sse.ts";
 import {
+  isSSEResponse,
+  reassembleAnthropicSSE,
+  reassembleResponsesSSE,
+} from "../lib/sse-reassemble.ts";
+import {
   apiErrorResponse,
   copilotApiErrorResponse,
   getErrorMessage,
@@ -155,6 +160,11 @@ async function handleDirectResponses(
 ): Promise<Response> {
   fixApplyPatchTools(payload);
 
+  const wantsStream = payload.stream === true;
+
+  // Always stream upstream to avoid blocking on large responses
+  payload.stream = true;
+
   const resp = await copilotFetch(
     "/responses",
     { method: "POST", body: JSON.stringify(payload) },
@@ -172,8 +182,10 @@ async function handleDirectResponses(
     );
   }
 
-  const contentType = resp.headers.get("content-type") ?? "application/json";
-  if (!contentType.includes("text/event-stream") && payload.stream !== true) {
+  if (!wantsStream) {
+    if (resp.body && isSSEResponse(resp)) {
+      return c.json(await reassembleResponsesSSE(resp.body));
+    }
     return c.json(await resp.json());
   }
 
@@ -196,10 +208,14 @@ async function handleViaMessages(
 
   const anthropicPayload = translateResponsesToAnthropicPayload(payload);
   filterThinkingBlocks(anthropicPayload);
+  const wantsStream = !!anthropicPayload.stream;
   const fetchOptions: CopilotFetchOptions = {
     vision: hasVision(payload),
     initiator: getInitiator(payload),
   };
+
+  // Always stream upstream to avoid blocking on large responses
+  anthropicPayload.stream = true;
 
   const resp = await copilotFetch(
     "/v1/messages",
@@ -218,12 +234,14 @@ async function handleViaMessages(
     );
   }
 
-  if (!anthropicPayload.stream) {
-    return c.json(
-      translateAnthropicToResponsesResult(
-        await resp.json() as AnthropicResponse,
-      ),
-    );
+  if (!wantsStream) {
+    let anthropicResponse: AnthropicResponse;
+    if (resp.body && isSSEResponse(resp)) {
+      anthropicResponse = await reassembleAnthropicSSE(resp.body);
+    } else {
+      anthropicResponse = await resp.json() as AnthropicResponse;
+    }
+    return c.json(translateAnthropicToResponsesResult(anthropicResponse));
   }
 
   if (!resp.body) return noUpstreamBodyApiErrorResponse(c);
