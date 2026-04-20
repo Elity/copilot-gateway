@@ -1,15 +1,18 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "copilot",
-  "main": "entry-cloudflare.ts",
-  "compatibility_date": "2025-01-01",
-  "account_id": "a49c8a74b8cbc962ad459cc234e9011a",
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "copilot-db",
-      "database_id": "927eca3e-9dcb-4574-afba-89b051db66cf",
-      "migrations_dir": "migrations"
-    }
-  ]
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "copilot",
+	"main": "entry-cloudflare.ts",
+	"compatibility_date": "2025-01-01",
+	"account_id": "32fdecdd7a75ddb32f62581194a1030a",
+	"routes": [
+		{ "pattern": "copilot.fighting.bid", "custom_domain": true }
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "copilot-db",
+			"database_id": "dbec2c31-8d4a-4645-ac9c-50387b69ea20",
+			"remote": true
+		}
+	]
 }
