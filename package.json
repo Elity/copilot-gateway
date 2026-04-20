@@ -32,5 +32,8 @@
     "vitest": "4.0.18",
     "vue-eslint-parser": "^10.4.0",
     "wrangler": "^4.81.0"
+  },
+  "scripts": {
+    "deploy": "wrangler deploy"
   }
 }
