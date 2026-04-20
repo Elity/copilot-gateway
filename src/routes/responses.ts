@@ -41,10 +41,20 @@ function isBase64Id(id: string): boolean {
   }
 }
 
-function generateReplacementId(type: string): string {
-  const rand = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+async function deriveReplacementId(type: string, originalId: string): Promise<string> {
+  // Deterministic: same originalId → same replacement. Upstream prompt cache
+  // keys on the serialized input, so generating a fresh random ID per request
+  // would defeat caching for the entire conversation history.
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(originalId),
+  );
+  const hex = Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 16);
   const prefix = type === "reasoning" ? "rs" : type === "function_call" ? "fc" : "msg";
-  return `${prefix}_${rand}`;
+  return `${prefix}_${hex}`;
 }
 
 async function markIdsAsInvalid(ids: string[]): Promise<void> {
@@ -64,18 +74,28 @@ async function replaceSpottedIds(payload: ResponsesPayload): Promise<boolean> {
 
   const cache = getRepo().cache;
   // deno-lint-ignore no-explicit-any
-  const results = await Promise.all(itemsWithId.map((it: any) =>
-    cache.get(`${SPOTTED_ID_PREFIX}${it.id}`)
+  const originalIds = itemsWithId.map((it: any) => it.id as string);
+  const results = await Promise.all(originalIds.map((id) =>
+    cache.get(`${SPOTTED_ID_PREFIX}${id}`)
   ));
 
   let replaced = false;
+  const toRefresh: string[] = [];
   for (let i = 0; i < itemsWithId.length; i++) {
     if (results[i] !== null) {
       // deno-lint-ignore no-explicit-any
       const it = itemsWithId[i] as any;
-      it.id = generateReplacementId(it.type ?? "message");
+      it.id = await deriveReplacementId(it.type ?? "message", originalIds[i]);
       replaced = true;
+      toRefresh.push(originalIds[i]);
     }
+  }
+  // Refresh TTL on hit so long-lived references stay remembered. The
+  // replacement ID itself is derived deterministically from the original,
+  // so cache value is just a presence marker — prompt-cache stability comes
+  // from the hash, not from stored state.
+  if (toRefresh.length > 0) {
+    await markIdsAsInvalid(toRefresh);
   }
   return replaced;
 }
