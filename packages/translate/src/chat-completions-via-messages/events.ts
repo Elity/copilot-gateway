@@ -1,6 +1,9 @@
+import { messagesRefusalExplanation } from '../shared/via-messages/refusal.ts';
+import { openAIServiceTierFromMessagesUsage } from '../shared/via-messages/service-tier.ts';
+import { inclusiveMessagesInputUsage } from '../shared/via-messages/usage.ts';
 import type { ChatCompletionsStreamEvent, ChatCompletionsResult, ChatCompletionsDelta } from '@floway-dev/protocols/chat-completions';
 import { doneFrame, eventFrame, type ProtocolFrame } from '@floway-dev/protocols/common';
-import type { MessagesResult, MessagesStreamEvent } from '@floway-dev/protocols/messages';
+import { mergeMessagesUsageSnapshot, messagesUsageSnapshot, type MessagesResult, type MessagesStreamEvent, type MessagesUsageSnapshot } from '@floway-dev/protocols/messages';
 
 const mapMessagesStopReasonToChatCompletionsFinishReason = (stopReason: MessagesResult['stop_reason']): ChatCompletionsResult['choices'][0]['finish_reason'] => {
   switch (stopReason) {
@@ -37,8 +40,7 @@ interface MessagesToChatCompletionsStreamState {
   model: string;
   created: number;
   nextToolCallIndex: number;
-  promptTokens: number;
-  cachedPromptTokens: number;
+  usage: MessagesUsageSnapshot;
   reasoningBlockIndex?: number;
 }
 
@@ -47,8 +49,7 @@ export const createMessagesToChatCompletionsStreamState = (): MessagesToChatComp
   model: '',
   created: Math.floor(Date.now() / 1000),
   nextToolCallIndex: 0,
-  promptTokens: 0,
-  cachedPromptTokens: 0,
+  usage: messagesUsageSnapshot(),
 });
 
 const claimReasoningBlock = (state: MessagesToChatCompletionsStreamState, index: number): boolean => {
@@ -70,25 +71,33 @@ const makeChunk = (state: MessagesToChatCompletionsStreamState, delta: ChatCompl
   ],
 });
 
-const makeUsageChunk = (state: MessagesToChatCompletionsStreamState, outputTokens: number): ChatCompletionsStreamEvent => ({
-  id: state.messageId,
-  object: 'chat.completion.chunk',
-  created: state.created,
-  model: state.model,
-  choices: [],
-  usage: {
-    prompt_tokens: state.promptTokens,
-    completion_tokens: outputTokens,
-    total_tokens: state.promptTokens + outputTokens,
-    ...(state.cachedPromptTokens > 0
-      ? {
-          prompt_tokens_details: {
-            cached_tokens: state.cachedPromptTokens,
-          },
-        }
-      : {}),
-  },
-});
+const makeUsageChunk = (state: MessagesToChatCompletionsStreamState): ChatCompletionsStreamEvent => {
+  const { cacheRead: cachedPromptTokens, cacheWrite, cacheWrite1h, inclusiveInput: promptTokens } = inclusiveMessagesInputUsage(state.usage);
+  const cacheCreationPromptTokens = cacheWrite + cacheWrite1h;
+  const serviceTier = openAIServiceTierFromMessagesUsage(state.usage);
+
+  return {
+    id: state.messageId,
+    object: 'chat.completion.chunk',
+    created: state.created,
+    model: state.model,
+    choices: [],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: state.usage.output_tokens,
+      total_tokens: promptTokens + state.usage.output_tokens,
+      ...(cachedPromptTokens > 0 || cacheCreationPromptTokens > 0
+        ? {
+            prompt_tokens_details: {
+              ...(cachedPromptTokens > 0 ? { cached_tokens: cachedPromptTokens } : {}),
+              ...(cacheCreationPromptTokens > 0 ? { cache_creation_input_tokens: cacheCreationPromptTokens } : {}),
+            },
+          }
+        : {}),
+    },
+    ...(serviceTier !== undefined ? { service_tier: serviceTier } : {}),
+  };
+};
 
 const unexpectedMessagesVariant = (value: never): never => {
   throw new Error(`Unexpected Messages stream variant: ${JSON.stringify(value)}`);
@@ -99,8 +108,7 @@ export const translateMessagesEventToChatCompletionsChunks = (event: MessagesStr
   case 'message_start': {
     state.messageId = event.message.id;
     state.model = event.message.model;
-    state.cachedPromptTokens = event.message.usage.cache_read_input_tokens ?? 0;
-    state.promptTokens = event.message.usage.input_tokens + state.cachedPromptTokens + (event.message.usage.cache_creation_input_tokens ?? 0);
+    state.usage = messagesUsageSnapshot(event.message.usage);
     return [makeChunk(state, { role: 'assistant' })];
   }
 
@@ -131,6 +139,9 @@ export const translateMessagesEventToChatCompletionsChunks = (event: MessagesStr
     case 'text':
     case 'server_tool_use':
     case 'web_search_tool_result':
+      return [];
+    case 'fallback':
+      state.model = block.to.model;
       return [];
     }
 
@@ -179,9 +190,18 @@ export const translateMessagesEventToChatCompletionsChunks = (event: MessagesStr
     return [];
 
   case 'message_delta': {
-    const chunk = makeChunk(state, {}, mapMessagesStopReasonToChatCompletionsFinishReason(event.delta.stop_reason ?? null));
+    const chunks: ChatCompletionsStreamEvent[] = [];
+    if (event.delta.stop_reason === 'refusal') {
+      chunks.push(makeChunk(state, { refusal: messagesRefusalExplanation(event.delta.stop_details) }));
+    }
+    chunks.push(makeChunk(state, {}, mapMessagesStopReasonToChatCompletionsFinishReason(event.delta.stop_reason ?? null)));
 
-    return event.usage ? [chunk, makeUsageChunk(state, event.usage.output_tokens)] : [chunk];
+    if (event.usage) {
+      state.usage = mergeMessagesUsageSnapshot(state.usage, event.usage);
+      chunks.push(makeUsageChunk(state));
+    }
+
+    return chunks;
   }
 
   case 'message_stop':

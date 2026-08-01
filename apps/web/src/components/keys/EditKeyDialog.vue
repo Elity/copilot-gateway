@@ -1,152 +1,236 @@
 <script setup lang="ts">
-import { Badge, Button, Dialog, Input, Sortable, Spinner, Switch } from '@floway-dev/ui';
 import { computed, ref, watch } from 'vue';
+import { RouterLink } from 'vue-router';
 
+import { type KeySource, KEY_SOURCE_OPTIONS } from './keySource.ts';
+import RetentionField, { type RetentionFieldValue } from './RetentionField.vue';
 import { callApi, useApi } from '../../api/client.ts';
-import type { ApiKey, UpstreamProviderKind, UpstreamRecord } from '../../api/types.ts';
+import type { ApiKey } from '../../api/types.ts';
+import type { UpstreamOption } from '../../composables/useUpstreamOptions.ts';
+import { useAuthStore } from '../../stores/auth.ts';
+import UpstreamPicker, { type UpstreamPickerValue } from '../upstreams/UpstreamPicker.vue';
+import { Button, Dialog, Input, Select } from '@floway-dev/ui';
 
 const open = defineModel<boolean>('open');
 
-const props = defineProps<{
-  apiKey?: ApiKey;
-  upstreams: UpstreamRecord[];
-}>();
+const props = defineProps<{ upstreams: UpstreamOption[] } & ({ mode: 'create' } | { mode: 'edit'; apiKey: ApiKey })>();
 
-const emit = defineEmits<{ saved: [] }>();
+const emit = defineEmits<{ saved: [apiKey: ApiKey] }>();
 
 const api = useApi();
+const auth = useAuthStore();
 
-interface RowState {
-  id: string;
-  name: string;
-  provider: UpstreamProviderKind | null;
-  enabled: boolean;
-}
+const visibleUpstreams = computed<UpstreamOption[]>(() => {
+  if (!auth.currentUser) throw new Error('EditKeyDialog rendered without an authenticated user');
+  const cap = auth.currentUser.upstreamIds;
+  if (cap === null) return props.upstreams;
+  const allowed = new Set(cap);
+  return props.upstreams.filter(u => allowed.has(u.id));
+});
+
+const dumpRetentionPresets = [
+  { seconds: 3600, label: '1 hour' },
+  { seconds: 6 * 3600, label: '6 hours' },
+  { seconds: 24 * 3600, label: '24 hours' },
+  { seconds: 7 * 86400, label: '7 days' },
+] as const;
+
+const responsesRetentionPresets = [
+  { seconds: 7 * 86400, label: '7 days' },
+  { seconds: 30 * 86400, label: '30 days' },
+] as const;
+
+const responsesRetentionMaximumSeconds = 10 * 365 * 86400;
 
 const name = ref('');
-const override = ref(false);
-const rows = ref<RowState[]>([]);
+const upstreamSelection = ref<UpstreamPickerValue>({ override: false, ids: [] });
+const dumpRetention = ref<RetentionFieldValue>(null);
+const responsesRetention = ref<RetentionFieldValue>(0);
+const keySource = ref<KeySource>('generate');
+const customKey = ref('');
 const saving = ref(false);
 const error = ref<string | null>(null);
 
 const reset = () => {
-  if (!props.apiKey) return;
-  name.value = props.apiKey.name;
-  override.value = props.apiKey.upstream_ids !== null;
-  const orderedIds = props.apiKey.upstream_ids ?? [];
-  const orderedSet = new Set(orderedIds);
-  // Order: existing selection first (preserve order), then the rest by their global sort_order.
-  const rest = props.upstreams.filter(u => !orderedSet.has(u.id));
-  rows.value = [
-    ...orderedIds.map(id => {
-      const u = props.upstreams.find(x => x.id === id);
-      return { id, name: u?.name ?? `Unknown (${id})`, provider: u?.provider ?? null, enabled: true };
-    }),
-    ...rest.map(u => ({ id: u.id, name: u.name, provider: u.provider, enabled: false })),
-  ];
+  if (props.mode === 'create') {
+    name.value = '';
+    upstreamSelection.value = { override: false, ids: [] };
+    dumpRetention.value = null;
+    responsesRetention.value = 0;
+    keySource.value = 'generate';
+    customKey.value = '';
+  } else {
+    name.value = props.apiKey.name;
+    // A key keeps the ids it was created with even after an admin narrows the
+    // owning user's cap, so a stored id can fall outside what this account may
+    // route to. An empty catalog means the option list is unavailable rather
+    // than genuinely empty — an empty deployment leaves nothing to drop anyway.
+    const stored = props.apiKey.upstream_ids ?? [];
+    const offered = new Set(visibleUpstreams.value.map(upstream => upstream.id));
+    upstreamSelection.value = {
+      override: props.apiKey.upstream_ids !== null,
+      ids: props.upstreams.length === 0 ? [...stored] : stored.filter(id => offered.has(id)),
+    };
+    dumpRetention.value = props.apiKey.dump_retention_seconds;
+    responsesRetention.value = props.apiKey.responses_retention_seconds;
+  }
   error.value = null;
 };
 
-watch(open, v => { if (v) reset(); });
+watch(open, v => { if (v) reset(); }, { immediate: true });
+
+const retentionEnabled = computed(() => {
+  const proposed = dumpRetention.value;
+  return proposed !== null && proposed !== 'invalid';
+});
+
+const retentionWarning = computed<string | null>(() => {
+  if (props.mode === 'create') return null;
+  const previous = props.apiKey.dump_retention_seconds;
+  if (previous === null) return null;
+  const next = dumpRetention.value;
+  if (next === 'invalid') return null;
+  if (next === null) return 'Saving will make existing dumps unavailable and queue them for deletion.';
+  if (next < previous) return 'Saving will hide dumps older than the new window and queue them for deletion.';
+  return null;
+});
+
+const responsesRetentionWarning = computed<string | null>(() => {
+  if (props.mode === 'create') return null;
+  const next = responsesRetention.value;
+  if (typeof next !== 'number' || next >= props.apiKey.responses_retention_seconds) return null;
+  if (next === 0) return 'Saving will hide all durable Stateful Responses chains and queue them for deletion. Re-enabling before cleanup may expose state inside the new window again.';
+  return 'Saving will make state older than the new window unavailable; chains that depend on it will stop resolving.';
+});
 
 const save = async () => {
-  if (!props.apiKey) return;
   const trimmed = name.value.trim();
   if (!trimmed) {
     error.value = 'Name is required';
     return;
   }
+  if (upstreamSelection.value.override && upstreamSelection.value.ids.length === 0) {
+    error.value = 'Select at least one upstream, or turn off the override to use every upstream available to you.';
+    return;
+  }
+  const nextDumpRetention = dumpRetention.value;
+  const nextResponsesRetention = responsesRetention.value;
+  if (nextDumpRetention === 'invalid' || typeof nextResponsesRetention !== 'number') {
+    error.value = 'Fix the invalid retention value before saving.';
+    return;
+  }
+  const custom = customKey.value.trim();
+  if (props.mode === 'create' && keySource.value === 'custom' && !custom) {
+    error.value = 'Custom API key is required.';
+    return;
+  }
+
   saving.value = true;
   error.value = null;
-  const body = {
+  const commonBody = {
     name: trimmed,
-    upstream_ids: override.value ? rows.value.filter(r => r.enabled).map(r => r.id) : null,
+    upstream_ids: upstreamSelection.value.override ? upstreamSelection.value.ids : null,
+    dump_retention_seconds: nextDumpRetention,
+    responses_retention_seconds: nextResponsesRetention,
   };
-  const { error: err } = await callApi(
-    () => api.api.keys[':id'].$patch({ param: { id: props.apiKey!.id }, json: body }),
-  );
+  const { data, error: err } = props.mode === 'create'
+    ? await callApi<ApiKey>(() => api.api.keys.$post({
+        json: {
+          ...commonBody,
+          key_source: keySource.value,
+          ...(keySource.value === 'custom' ? { custom_key: custom } : {}),
+        },
+      }))
+    : await callApi<ApiKey>(
+        () => api.api.keys[':id'].$patch({ param: { id: props.apiKey.id }, json: commonBody }),
+      );
   saving.value = false;
   if (err) {
     error.value = err.message;
     return;
   }
+  if (!data) throw new Error('API key save succeeded without returning the saved key');
   open.value = false;
-  emit('saved');
-};
-
-const titleText = 'Edit API Key';
-
-const enabledCount = computed(() => rows.value.filter(r => r.enabled).length);
-const overrideBadgeCount = computed(() => override.value ? enabledCount.value : props.upstreams.length);
-
-const providerTone = (provider: UpstreamProviderKind | null): 'amber' | 'emerald' | 'cyan' | 'zinc' => {
-  if (provider === 'custom') return 'amber';
-  if (provider === 'azure') return 'emerald';
-  if (provider === 'copilot') return 'cyan';
-  return 'zinc';
-};
-
-const providerLabel = (provider: UpstreamProviderKind | null) => {
-  if (provider === 'custom') return 'Custom';
-  if (provider === 'azure') return 'Azure';
-  if (provider === 'copilot') return 'Copilot';
-  return 'Unknown';
+  emit('saved', data);
 };
 </script>
 
 <template>
-  <Dialog v-model:open="open" :title="titleText" size="lg" :auto-focus-on-open="false">
+  <Dialog v-model:open="open" :title="mode === 'create' ? 'Create API Key' : 'Edit API Key'" size="lg" :auto-focus-on-open="false">
     <div class="space-y-5">
       <div class="space-y-2">
         <label class="block text-xs font-medium text-gray-500">Name</label>
         <Input v-model="name" />
       </div>
 
-      <div class="space-y-3">
-        <label class="flex items-center justify-between rounded-md border border-white/[0.06] bg-surface-800/40 px-3 py-2.5">
-          <span>
-            <p class="text-sm text-white">
-              Override Available Upstreams
-              <span class="ml-1.5 font-mono text-[10px] font-medium text-accent-cyan">({{ overrideBadgeCount }})</span>
-            </p>
-            <p class="text-xs text-gray-500">When off, this key inherits the global upstream order.</p>
-          </span>
-          <Switch v-model="override" />
-        </label>
+      <UpstreamPicker
+        v-model="upstreamSelection"
+        :available="visibleUpstreams"
+        title="Override Available Upstreams"
+        inherit-description="When off, this key inherits the global upstream order."
+      />
 
-        <Sortable
-          v-if="override"
-          v-model="rows"
-          :item-key="r => r.id"
-          handle=".floway-drag-handle"
-          tag="ul"
-          class="space-y-1.5"
-        >
-          <template #default="{ item: row }">
-            <li :key="row.id" class="flex items-center gap-3 rounded-md border border-white/[0.06] bg-surface-800/40 px-3 py-2">
-              <button
-                type="button"
-                class="floway-drag-handle grid size-6 cursor-grab place-items-center rounded text-gray-500 hover:bg-surface-700 hover:text-gray-200 active:cursor-grabbing"
-                aria-label="Drag to reorder"
-              >
-                <i class="i-lucide-grip-vertical size-4" />
-              </button>
-              <Switch :model-value="row.enabled" @update:model-value="v => row.enabled = !!v" />
-              <Badge :tone="providerTone(row.provider)" size="sm" class="shrink-0 !rounded !uppercase tracking-wide">{{ providerLabel(row.provider) }}</Badge>
-              <span class="min-w-0 flex-1 truncate text-sm text-white">{{ row.name }}</span>
-              <code class="text-xs text-gray-500">{{ row.id }}</code>
-            </li>
+      <div v-if="mode === 'create'" class="space-y-2">
+        <label class="block text-xs font-medium text-gray-500">New key</label>
+        <Select v-model="keySource" :options="KEY_SOURCE_OPTIONS">
+          <template #description="{ option }">
+            <span class="text-xs text-gray-500">{{ option.description }}</span>
           </template>
-        </Sortable>
+        </Select>
+        <Input
+          v-if="keySource === 'custom'"
+          v-model="customKey"
+          placeholder="Paste custom API key"
+        />
       </div>
+
+      <RetentionField
+        v-model="dumpRetention"
+        label="Request dump retention"
+        description="When enabled, every model-invoking request through this key is recorded for the configured window. Off means no capture."
+        :off-value="null"
+        off-label="Off (do not capture)"
+        :presets="dumpRetentionPresets"
+      >
+        <p v-if="retentionWarning" role="status" aria-live="polite" class="rounded-md border border-accent-amber/40 bg-accent-amber/10 px-3 py-2 text-xs text-accent-amber">
+          {{ retentionWarning }}
+        </p>
+        <p v-if="props.mode === 'edit' && retentionEnabled" class="text-xs text-gray-500">
+          <RouterLink :to="`/dashboard/requests/${props.apiKey.id}`" class="text-accent-cyan hover:underline">
+            View captured requests →
+          </RouterLink>
+        </p>
+      </RetentionField>
+
+      <RetentionField
+        v-model="responsesRetention"
+        label="Stateful Responses retention"
+        :off-value="0"
+        off-label="Off (do not persist)"
+        :presets="responsesRetentionPresets"
+        :minimum-seconds="86400"
+        :maximum-seconds="responsesRetentionMaximumSeconds"
+        custom-input-unit="days"
+      >
+        <template #description>
+          <p>
+            When enabled, items and responses produced by <code class="rounded bg-surface-700 px-1 py-0.5 font-mono text-[11px] text-gray-300">store: true</code> Responses API requests are persisted for the configured number of days, so they can be referenced by <code class="rounded bg-surface-700 px-1 py-0.5 font-mono text-[11px] text-gray-300">item_reference</code> and <code class="rounded bg-surface-700 px-1 py-0.5 font-mono text-[11px] text-gray-300">previous_response_id</code> during that period.
+          </p>
+          <p class="mt-2">
+            Codex's WebSocket non-persistent session store works independently.
+          </p>
+        </template>
+        <p v-if="responsesRetentionWarning" role="status" aria-live="polite" class="rounded-md border border-accent-amber/40 bg-accent-amber/10 px-3 py-2 text-xs text-accent-amber">
+          {{ responsesRetentionWarning }}
+        </p>
+      </RetentionField>
 
       <p v-if="error" class="rounded-md border border-accent-rose/40 bg-accent-rose/10 px-3 py-2 text-xs text-accent-rose">{{ error }}</p>
 
       <footer class="flex items-center justify-end gap-2">
         <Button variant="secondary" :disabled="saving" @click="open = false">Cancel</Button>
         <Button :loading="saving" @click="save">
-          <Spinner v-if="saving" class="size-3.5" />
-          Save changes
+          {{ mode === 'create' ? 'Create key' : 'Save changes' }}
         </Button>
       </footer>
     </div>

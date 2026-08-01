@@ -5,8 +5,6 @@
 // without a gateway-side reject while named fields keep their narrow
 // types when accessed directly — the `T & Record<string, unknown>`
 // intersection form would widen every typed field to `unknown` on read.
-// /v1/images/edits is multipart and has no JSON payload type — its source
-// serve handles `FormData` directly.
 export interface ImagesGenerationsPayload {
   model: string;
   prompt: string;
@@ -23,3 +21,11 @@ export interface ImagesGenerationsPayload {
   user?: string;
   [key: string]: unknown;
 }
+
+// POST /v1/images/edits accepts JSON references that point at a URL/data URL
+// or an uploaded file.
+// https://github.com/openai/openai-openapi/blob/a3276900e58b8b2a92e0cb087cd2e6e005f58458/openapi.yaml#L12558-L12620
+// https://github.com/openai/openai-openapi/blob/a3276900e58b8b2a92e0cb087cd2e6e005f58458/openapi.yaml#L47542-L47673
+export type ImageEditReference =
+  | { image_url: string; file_id?: never; [key: string]: unknown }
+  | { file_id: string; image_url?: never; [key: string]: unknown };

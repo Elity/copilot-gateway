@@ -1,6 +1,11 @@
 import { type ChatCompletionsScalarReasoning, chatCompletionsScalarReasoningFromMessagesBlock } from '../shared/chat-completions-and-messages/reasoning.ts';
-import { openAiJsonSchemaCoreFromMessagesFormat } from '../shared/messages/structured-output.ts';
+import { filterMessagesClientTools } from '../shared/messages-via/client-tools.ts';
+import { resolveMessagesReasoningEffort } from '../shared/messages-via/reasoning-effort.ts';
+import { openAIServiceTierFromMessages } from '../shared/messages-via/service-tier.ts';
+import { openAiJsonSchemaCoreFromMessagesFormat } from '../shared/messages-via/structured-output.ts';
+import { flattenMessagesToolResult } from '../shared/messages-via/tool-result.ts';
 import { normalizeMessagesToolInputSchema } from '../shared/messages-via/tool-schema.ts';
+import { TranslatorInputError } from '../translator-input-error.ts';
 import type { ChatCompletionsPayload, ChatCompletionsContentPart, ChatCompletionsMessage, ChatCompletionsTool, ChatCompletionsToolCall } from '@floway-dev/protocols/chat-completions';
 import type {
   MessagesAssistantContentBlock,
@@ -9,6 +14,7 @@ import type {
   MessagesMessage,
   MessagesPayload,
   MessagesServerToolUseBlock,
+  MessagesSystemMessage,
   MessagesTextBlock,
   MessagesToolResultBlock,
   MessagesToolUseBlock,
@@ -18,12 +24,6 @@ import type {
 
 const toChatCompletionsContent = (content: string | MessagesUserContentBlock[] | MessagesAssistantContentBlock[]): string | ChatCompletionsContentPart[] | null => {
   if (typeof content === 'string') return content;
-
-  for (const block of content) {
-    if (block.type !== 'text' && block.type !== 'image') {
-      throw new Error(`Messages → Chat Completions translator does not accept ${block.type} content blocks in message content.`);
-    }
-  }
 
   if (!content.some(block => block.type === 'image')) {
     return content
@@ -51,19 +51,6 @@ const toChatCompletionsContent = (content: string | MessagesUserContentBlock[] |
   }
 
   return parts;
-};
-
-const toChatCompletionsToolResultContent = (content: MessagesToolResultBlock['content']): string => {
-  if (typeof content === 'string') {
-    return content;
-  }
-
-  const textBlocks = content.filter((block): block is MessagesTextBlock => block.type === 'text');
-  if (textBlocks.length === content.length) {
-    return textBlocks.map(block => block.text).join('\n\n');
-  }
-
-  return JSON.stringify(content);
 };
 
 const toChatCompletionsFunctionCall = (block: MessagesToolUseBlock | MessagesServerToolUseBlock): ChatCompletionsToolCall => ({
@@ -102,7 +89,7 @@ const flushPendingAssistantMessage = (messages: ChatCompletionsMessage[], pendin
     ...(reasoning
       ? {
           reasoning_text: reasoning.reasoningText,
-          reasoning_opaque: reasoning.hasReasoningOpaque ? reasoning.reasoningOpaque : null,
+          reasoning_opaque: reasoning.reasoningOpaque,
         }
       : {}),
   });
@@ -112,12 +99,7 @@ const flushPendingAssistantMessage = (messages: ChatCompletionsMessage[], pendin
   pending.scalarReasoning = null;
 };
 
-const getClientTools = (tools?: MessagesPayload['tools']): MessagesClientTool[] | undefined => {
-  const clientTools = tools?.filter((tool): tool is MessagesClientTool => tool.type === undefined || tool.type === 'custom');
-  return clientTools?.length ? clientTools : undefined;
-};
-
-const translateMessagesUser = (message: MessagesUserMessage): ChatCompletionsMessage[] => {
+const translateMessagesUser = (message: MessagesUserMessage, messageIdx: number): ChatCompletionsMessage[] => {
   if (!Array.isArray(message.content)) {
     return [
       {
@@ -140,20 +122,24 @@ const translateMessagesUser = (message: MessagesUserMessage): ChatCompletionsMes
     pendingUserBlocks.length = 0;
   };
 
-  for (const block of message.content) {
-    if (block.type !== 'tool_result') {
-      pendingUserBlocks.push(block);
+  for (const [blockIdx, block] of message.content.entries()) {
+    if (block.type === 'tool_result') {
+      // Preserving source chronology matters more than keeping one Chat message,
+      // so interleaved user content and tool results become alternating messages.
+      flushPendingUserBlocks();
+      messages.push({
+        role: 'tool',
+        tool_call_id: block.tool_use_id,
+        content: flattenMessagesToolResult(block.content),
+      });
       continue;
     }
 
-    // Preserving source chronology matters more than keeping one Chat message,
-    // so interleaved user content and tool results become alternating messages.
-    flushPendingUserBlocks();
-    messages.push({
-      role: 'tool',
-      tool_call_id: block.tool_use_id,
-      content: toChatCompletionsToolResultContent(block.content),
-    });
+    if (block.type !== 'text' && block.type !== 'image') {
+      throw new TranslatorInputError(`messages.${messageIdx}.content.${blockIdx}.type: '${(block as { type: string }).type}' content blocks are not supported on this model`);
+    }
+
+    pendingUserBlocks.push(block);
   }
 
   flushPendingUserBlocks();
@@ -161,7 +147,7 @@ const translateMessagesUser = (message: MessagesUserMessage): ChatCompletionsMes
   return messages;
 };
 
-const translateMessagesAssistant = (message: MessagesAssistantMessage): ChatCompletionsMessage[] => {
+const translateMessagesAssistant = (message: MessagesAssistantMessage, messageIdx: number): ChatCompletionsMessage[] => {
   if (!Array.isArray(message.content)) {
     return [
       {
@@ -178,7 +164,7 @@ const translateMessagesAssistant = (message: MessagesAssistantMessage): ChatComp
     scalarReasoning: null,
   };
 
-  for (const block of message.content) {
+  for (const [blockIdx, block] of message.content.entries()) {
     switch (block.type) {
     case 'text':
       pending.textParts.push(block.text);
@@ -200,7 +186,7 @@ const translateMessagesAssistant = (message: MessagesAssistantMessage): ChatComp
       });
       break;
     default:
-      throw new Error(`Messages → Chat Completions translator does not accept ${(block as { type: string }).type} assistant content blocks.`);
+      throw new TranslatorInputError(`messages.${messageIdx}.content.${blockIdx}.type: '${(block as { type: string }).type}' assistant content blocks are not supported on this model`);
     }
   }
 
@@ -208,19 +194,44 @@ const translateMessagesAssistant = (message: MessagesAssistantMessage): ChatComp
   return messages;
 };
 
+// Anthropic Messages system blocks are prompt boundaries; preserve each one
+// as a separate Chat Completions text part so a CC→Messages→CC round trip
+// does not silently merge them. Falls back to the simple string form when
+// the source is already a single-string field.
+const systemContentFromBlocks = (system: string | MessagesTextBlock[]): string | ChatCompletionsContentPart[] =>
+  typeof system === 'string'
+    ? system
+    : system.map(block => ({ type: 'text', text: block.text }));
+
+const translateMessagesSystem = (message: MessagesSystemMessage): ChatCompletionsMessage[] => [
+  {
+    role: 'system',
+    content: systemContentFromBlocks(message.content),
+  },
+];
+
 const translateMessagesInput = (messages: MessagesMessage[], system: string | MessagesTextBlock[] | undefined): ChatCompletionsMessage[] => {
-  // Messages system blocks are prompt boundaries; keep them as separated
-  // paragraphs when falling back to Chat Completions.
-  const systemMessages: ChatCompletionsMessage[] = system
-    ? [
+  const isEmptySystem = system == null || (typeof system === 'string' ? system === '' : system.length === 0);
+  const systemMessages: ChatCompletionsMessage[] = isEmptySystem
+    ? []
+    : [
         {
           role: 'system',
-          content: typeof system === 'string' ? system : system.map(block => block.text).join('\n\n'),
+          content: systemContentFromBlocks(system),
         },
-      ]
-    : [];
+      ];
 
-  return [...systemMessages, ...messages.flatMap(message => (message.role === 'user' ? translateMessagesUser(message) : translateMessagesAssistant(message)))];
+  return [
+    ...systemMessages,
+    ...messages.flatMap((message, messageIdx): ChatCompletionsMessage[] => {
+      switch (message.role) {
+      case 'user': return translateMessagesUser(message, messageIdx);
+      case 'assistant': return translateMessagesAssistant(message, messageIdx);
+      case 'system': return translateMessagesSystem(message);
+      default: throw new TranslatorInputError(`messages.${messageIdx}.role: role '${(message as { role: string }).role}' is not supported on this model`);
+      }
+    }),
+  ];
 };
 
 const translateMessagesTools = (tools?: MessagesClientTool[]): ChatCompletionsTool[] | undefined =>
@@ -251,18 +262,15 @@ const translateMessagesToolChoice = (toolChoice?: MessagesPayload['tool_choice']
   }
 };
 
-export const translateMessagesToChatCompletions = (payload: MessagesPayload): ChatCompletionsPayload => {
-  const clientTools = getClientTools(payload.tools);
+export const buildTargetRequest = (payload: MessagesPayload): ChatCompletionsPayload => {
+  const clientTools = filterMessagesClientTools(payload.tools);
   // Pass effort through verbatim; per-upstream enum acceptance (e.g. some
   // backends rejecting `xhigh`/`max`) is the target interceptor's concern.
-  let reasoningEffort: string | undefined;
-  if (payload.output_config?.effort) {
-    reasoningEffort = payload.output_config.effort;
-  } else if (payload.thinking?.type === 'disabled') {
-    reasoningEffort = 'none';
-  }
+  const reasoningEffort = resolveMessagesReasoningEffort(payload);
   const jsonSchema = openAiJsonSchemaCoreFromMessagesFormat(payload.output_config?.format);
   const responseFormat = jsonSchema ? { type: 'json_schema' as const, json_schema: jsonSchema } : undefined;
+
+  const serviceTier = openAIServiceTierFromMessages(payload);
 
   return {
     model: payload.model,
@@ -276,7 +284,6 @@ export const translateMessagesToChatCompletions = (payload: MessagesPayload): Ch
     tools: translateMessagesTools(clientTools),
     tool_choice: translateMessagesToolChoice(payload.tool_choice, clientTools),
     ...(responseFormat ? { response_format: responseFormat } : {}),
+    ...(serviceTier !== undefined ? { service_tier: serviceTier } : {}),
   };
 };
-
-export const buildTargetRequest = translateMessagesToChatCompletions;

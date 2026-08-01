@@ -1,60 +1,21 @@
 <script lang="ts">
-import { defineBasicLoader } from 'unplugin-vue-router/data-loaders/basic';
-
-import { callApi as callApiForLoader, useApi as useApiForLoader } from '../../api/client.ts';
-import { dashboardRangeQuery as dashboardRangeQueryForLoader } from '../../components/charts/dashboard-chart.ts';
-import { useModelsStore as useModelsStoreForLoader } from '../../composables/useModels.ts';
-
-type BillingDimension = 'input' | 'input_cache_read' | 'input_cache_write' | 'input_image' | 'output' | 'output_image';
-
-interface LoaderUsageResponse {
-  records: Array<{
-    keyId: string;
-    keyName?: string;
-    keyCreatedAt?: string;
-    model: string;
-    hour: string;
-    requests: number;
-    tokens: Partial<Record<BillingDimension, number>>;
-    cost: number;
-  }>;
-  keys: Array<{ id: string; name: string; createdAt: string }>;
-  keyColorOrder: string[];
-}
-
-interface LoaderSearchUsageResponse {
-  records: Array<{ provider: string; keyId: string; keyName?: string; keyCreatedAt?: string; hour: string; requests: number }>;
-  keys: Array<{ id: string; name: string; createdAt: string }>;
-  keyColorOrder: string[];
-  activeProvider: string;
-}
-
-export const useUsagePageData = defineBasicLoader(async () => {
-  const api = useApiForLoader();
-  const { start, end } = dashboardRangeQueryForLoader('today');
-  const [usageRes, searchRes] = await Promise.all([
-    callApiForLoader<LoaderUsageResponse>(() => api.api['token-usage'].$get({ query: { start, end, include_key_metadata: '1' } })),
-    callApiForLoader<LoaderSearchUsageResponse>(() => api.api['search-usage'].$get({ query: { start, end, include_key_metadata: '1' } })),
-    useModelsStoreForLoader().load(),
-  ]);
-  return {
-    usage: usageRes.data ?? { records: [], keys: [], keyColorOrder: [] },
-    search: searchRes.data ?? { records: [], keys: [], keyColorOrder: [], activeProvider: 'disabled' },
-  };
-});
-</script>
-
-<script setup lang="ts">
-import { OverlayScrollbars, Spinner } from '@floway-dev/ui';
+import { useIntervalFn } from '@vueuse/core';
 import type { TooltipItem } from 'chart.js';
 import type { ChartConfiguration } from 'chart.js/auto';
+import { defineBasicLoader } from 'unplugin-vue-router/data-loaders/basic';
 import { computed, ref, watch } from 'vue';
 
-import { callApi, useApi } from '../../api/client.ts';
-import { bucketKeyForUtcHour, chartColor, chartFont, chartXAxisTick, dashboardBuckets, dashboardRangeQuery, type DashboardRange } from '../../components/charts/dashboard-chart.ts';
+import { callApi, useApi, type ApiClient } from '../../api/client.ts';
+import type { BillingMetric, DecimalString } from '../../api/types.ts';
 import ChartCanvas from '../../components/charts/ChartCanvas.vue';
+import ChartSeriesControls from '../../components/charts/ChartSeriesControls.vue';
+import { bucketKeyForUtcHour, chartColor, chartFont, chartXAxisTick, dashboardBuckets, dashboardRangeQuery, type DashboardRange } from '../../components/charts/dashboard-chart.ts';
+import { applySeriesSelection, chartSeriesIds, createSeriesIsolation, handleLegendClick } from '../../components/charts/series-selection.ts';
 import UsageSummaryMetric from '../../components/usage/UsageSummaryMetric.vue';
 import { useModelsStore } from '../../composables/useModels.ts';
+import { useAuthStore } from '../../stores/auth.ts';
+import { decimalStringToChartNumber, formatDecimalQuantity, formatUsd, sumDecimalStrings } from '../../utils/decimal-display.ts';
+import { OverlayScrollbars, Spinner } from '@floway-dev/ui';
 
 interface DisplayUsageRecord {
   keyId: string;
@@ -63,22 +24,90 @@ interface DisplayUsageRecord {
   model: string;
   hour: string;
   requests: number;
-  tokens: Partial<Record<BillingDimension, number>>;
-  cost: number;
+  metrics: Array<{ metric: BillingMetric; quantity: DecimalString }>;
+  cost: DecimalString | null;
 }
+
 interface UsageResponse {
   records: DisplayUsageRecord[];
-  keys: Array<{ id: string; name: string; createdAt: string }>;
-  keyColorOrder: string[];
+  keys: Array<{ id: string; name: string; createdAt?: string }>;
 }
+
 interface SearchUsageRecord { provider: string; keyId: string; keyName?: string; keyCreatedAt?: string; hour: string; requests: number }
+
 interface SearchUsageResponse {
   records: SearchUsageRecord[];
-  keys: Array<{ id: string; name: string; createdAt: string }>;
-  keyColorOrder: string[];
+  keys: Array<{ id: string; name: string; createdAt?: string }>;
   activeProvider: string;
 }
 
+interface UsageByUserResponse {
+  records: Array<{
+    userId: number;
+    model: string;
+    hour: string;
+    requests: number;
+    metrics: Array<{ metric: BillingMetric; quantity: DecimalString }>;
+    cost: DecimalString | null;
+  }>;
+  users: Array<{ id: number; username: string }>;
+}
+
+interface SearchUsageByUserResponse {
+  records: Array<{ provider: string; userId: number; hour: string; requests: number }>;
+  users: Array<{ id: number; username: string }>;
+  activeProvider: string;
+}
+
+type UsageView = 'all-by-user' | 'self-by-key';
+
+const userBucketId = (userId: number): string => `user-${userId}`;
+
+const fetchUsageForView = async (
+  api: ApiClient,
+  view: UsageView,
+  start: string,
+  end: string,
+): Promise<{ usage: UsageResponse | null; search: SearchUsageResponse | null }> => {
+  if (view === 'all-by-user') {
+    const [usageRes, searchRes] = await Promise.all([
+      callApi<UsageByUserResponse>(() => api.api['token-usage'].$get({ query: { start, end, include_user_metadata: '1', view: 'all-by-user' } })),
+      callApi<SearchUsageByUserResponse>(() => api.api['search-usage'].$get({ query: { start, end, include_user_metadata: '1', view: 'all-by-user' } })),
+    ]);
+    return {
+      usage: usageRes.data
+        ? { records: usageRes.data.records.map(r => ({ keyId: userBucketId(r.userId), model: r.model, hour: r.hour, requests: r.requests, metrics: r.metrics, cost: r.cost })), keys: usageRes.data.users.map(u => ({ id: userBucketId(u.id), name: u.username })) }
+        : null,
+      search: searchRes.data
+        ? { records: searchRes.data.records.map(r => ({ provider: r.provider, keyId: userBucketId(r.userId), hour: r.hour, requests: r.requests })), keys: searchRes.data.users.map(u => ({ id: userBucketId(u.id), name: u.username })), activeProvider: searchRes.data.activeProvider }
+        : null,
+    };
+  }
+  const [usageRes, searchRes] = await Promise.all([
+    callApi<UsageResponse>(() => api.api['token-usage'].$get({ query: { start, end, include_key_metadata: '1', view: 'self-by-key' } })),
+    callApi<SearchUsageResponse>(() => api.api['search-usage'].$get({ query: { start, end, include_key_metadata: '1', view: 'self-by-key' } })),
+  ]);
+  return { usage: usageRes.data ?? null, search: searchRes.data ?? null };
+};
+
+export const useUsagePageData = defineBasicLoader(async () => {
+  const api = useApi();
+  const auth = useAuthStore();
+  const view: UsageView = auth.isAdmin ? 'all-by-user' : 'self-by-key';
+  const { start, end } = dashboardRangeQuery('today', Date.now());
+  const [{ usage, search }] = await Promise.all([
+    fetchUsageForView(api, view, start, end),
+    useModelsStore().load(),
+  ]);
+  return {
+    view,
+    usage: usage ?? { records: [], keys: [] },
+    search: search ?? { records: [], keys: [], activeProvider: 'disabled' },
+  };
+});
+</script>
+
+<script setup lang="ts">
 type Metric =
   | 'requests' | 'cost'
   | 'total' | 'input' | 'output' | 'prefill'
@@ -86,16 +115,22 @@ type Metric =
   | 'cacheCreation' | 'cacheHitRate';
 type Range = DashboardRange;
 
-const dim = (r: DisplayUsageRecord, k: BillingDimension): number => r.tokens[k] ?? 0;
+const metricQuantity = (r: DisplayUsageRecord, metric: BillingMetric): DecimalString =>
+  r.metrics.find(row => row.metric === metric)?.quantity ?? '0';
 
 const api = useApi();
+const auth = useAuthStore();
 const initialUsageData = useUsagePageData();
 const modelsStore = useModelsStore();
 
 const tokenRange = ref<Range>('today');
 const loadedTokenRange = ref<Range>('today');
+// Buckets and the request window are derived from the same `loadedAt` so the
+// chart axis stays in lockstep with whichever data snapshot is currently shown.
+const loadedAt = ref(Date.now());
 const tokenChartMetric = ref<Metric>('total');
 const redactKeys = ref(false);
+const view = ref<UsageView>(initialUsageData.data.value.view);
 const data = ref<UsageResponse | null>(initialUsageData.data.value.usage);
 const searchData = ref<SearchUsageResponse | null>(initialUsageData.data.value.search);
 const tokenLoading = ref(false);
@@ -111,26 +146,21 @@ let usageRequestId = 0;
 const hiddenKeys = ref(new Set<string>());
 const hiddenModels = ref(new Set<string>());
 
-const toggleHidden = (set: Set<string>, id: string) => {
-  if (set.has(id)) set.delete(id);
-  else set.add(id);
-};
-
 const load = async () => {
   const requestId = ++usageRequestId;
   const requestedRange = tokenRange.value;
+  const requestedView = view.value;
+  const requestedAt = Date.now();
   tokenLoading.value = true;
   searchUsageLoading.value = true;
-  const { start, end } = dashboardRangeQuery(requestedRange);
+  const { start, end } = dashboardRangeQuery(requestedRange, requestedAt);
   try {
-    const [usageRes, searchRes] = await Promise.all([
-      callApi<UsageResponse>(() => api.api['token-usage'].$get({ query: { start, end, include_key_metadata: '1' } })),
-      callApi<SearchUsageResponse>(() => api.api['search-usage'].$get({ query: { start, end, include_key_metadata: '1' } })),
-    ]);
-    if (requestId !== usageRequestId || tokenRange.value !== requestedRange) return;
-    if (usageRes.data) data.value = usageRes.data;
-    if (searchRes.data) searchData.value = searchRes.data;
+    const { usage, search } = await fetchUsageForView(api, requestedView, start, end);
+    if (requestId !== usageRequestId || tokenRange.value !== requestedRange || view.value !== requestedView) return;
+    if (usage) data.value = usage;
+    if (search) searchData.value = search;
     loadedTokenRange.value = requestedRange;
+    loadedAt.value = requestedAt;
   } finally {
     if (requestId === usageRequestId) {
       tokenLoading.value = false;
@@ -146,46 +176,51 @@ const switchTokenRange = (r: Range) => {
 const switchTokenChartMetric = (m: string) => { tokenChartMetric.value = m as Metric; };
 
 watch(tokenRange, load);
+watch(view, load);
+useIntervalFn(() => { void load(); }, 60_000);
 
 const tokenSummary = computed(() => {
   const records = (data.value?.records ?? []).filter(r => !hiddenKeys.value.has(r.keyId) && !hiddenModels.value.has(r.model));
-  let requests = 0, cost = 0, input = 0, output = 0, cacheRead = 0, cacheCreation = 0, inputImage = 0, outputImage = 0;
+  let requests = 0;
+  let cost: DecimalString | null = null;
+  let input: DecimalString = '0', output: DecimalString = '0', cacheRead: DecimalString = '0', cacheCreation: DecimalString = '0', inputImage: DecimalString = '0', inputAudio: DecimalString = '0', outputImage: DecimalString = '0';
   for (const r of records) {
     requests += r.requests;
-    cost += r.cost;
-    input += dim(r, 'input');
-    output += dim(r, 'output');
-    cacheRead += dim(r, 'input_cache_read');
-    cacheCreation += dim(r, 'input_cache_write');
-    inputImage += dim(r, 'input_image');
-    outputImage += dim(r, 'output_image');
+    if (r.cost !== null) cost = sumDecimalStrings(cost ?? '0', r.cost);
+    input = sumDecimalStrings(input, metricQuantity(r, 'input_tokens'));
+    output = sumDecimalStrings(output, metricQuantity(r, 'output_tokens'));
+    cacheRead = sumDecimalStrings(cacheRead, metricQuantity(r, 'input_cache_read_tokens'));
+    cacheCreation = sumDecimalStrings(cacheCreation, metricQuantity(r, 'input_cache_write_tokens'), metricQuantity(r, 'input_cache_write_1h_tokens'));
+    inputImage = sumDecimalStrings(inputImage, metricQuantity(r, 'input_image_tokens'));
+    inputAudio = sumDecimalStrings(inputAudio, metricQuantity(r, 'input_audio_tokens'));
+    outputImage = sumDecimalStrings(outputImage, metricQuantity(r, 'output_image_tokens'));
   }
   return {
     requests, cost, cacheRead, cacheCreation,
-    // Input and Output mix text and image token counts into one figure. The
-    // per-modality split only affects pricing (applied per dimension already),
-    // so we avoid extra image-only columns. Input is the inclusive prompt total
-    // (text + image, uncached + cache read + cache write); prefill is that total
-    // minus cache reads; output is text + image output.
-    input: input + cacheRead + cacheCreation + inputImage,
-    output: output + outputImage,
-    total: input + output + cacheRead + cacheCreation + inputImage + outputImage,
-    prefill: input + cacheCreation + inputImage,
+    // Input and Output mix text, image, and audio token counts into one figure. The
+    // per-modality split only affects pricing (applied per metric already),
+    // so we avoid extra modality-only columns. Input is the inclusive prompt total
+    // (text + image + audio, uncached + cache read + cache write); prefill is that
+    // total minus cache reads; output is text + image output.
+    input: sumDecimalStrings(input, cacheRead, cacheCreation, inputImage, inputAudio),
+    output: sumDecimalStrings(output, outputImage),
+    total: sumDecimalStrings(input, output, cacheRead, cacheCreation, inputImage, inputAudio, outputImage),
+    prefill: sumDecimalStrings(input, cacheCreation, inputImage, inputAudio),
   };
 });
 
-const formatInputRate = (cached: number, input: number) => {
-  if (input <= 0) return '—';
-  const pct = (cached / input) * 100;
+const formatInputRate = (cached: DecimalString, input: DecimalString) => {
+  if (input === '0') return '—';
+  const pct = (decimalStringToChartNumber(cached) / decimalStringToChartNumber(input)) * 100;
   return `${pct.toFixed(1)}%`;
 };
-const formatHitRate = (cached: number, created: number) => {
-  const denom = cached + created;
-  if (denom <= 0) return '—';
-  return `${((cached / denom) * 100).toFixed(1)}%`;
+const formatHitRate = (cached: DecimalString, created: DecimalString) => {
+  const denominator = sumDecimalStrings(cached, created);
+  if (denominator === '0') return '—';
+  return `${((decimalStringToChartNumber(cached) / decimalStringToChartNumber(denominator)) * 100).toFixed(1)}%`;
 };
 
-const buckets = computed(() => dashboardBuckets(loadedTokenRange.value));
+const buckets = computed(() => dashboardBuckets(loadedTokenRange.value, loadedAt.value));
 
 const TOKEN_CHART_METRICS: Record<Metric, { label: string; kind: 'count' | 'cost' | 'tokens' | 'percent' }> = {
   requests: { label: 'Requests', kind: 'count' },
@@ -202,19 +237,19 @@ const TOKEN_CHART_METRICS: Record<Metric, { label: string; kind: 'count' | 'cost
 
 const isPercentMetric = (metric: Metric) => TOKEN_CHART_METRICS[metric].kind === 'percent';
 
-const metricValue = (r: DisplayUsageRecord, metric: Metric): number => {
+const metricValue = (r: DisplayUsageRecord, metric: Metric): DecimalString | null => {
   switch (metric) {
-  case 'requests': return r.requests;
+  case 'requests': return String(r.requests);
   case 'cost': return r.cost;
-  case 'total': return dim(r, 'input') + dim(r, 'output') + dim(r, 'input_cache_read') + dim(r, 'input_cache_write') + dim(r, 'input_image') + dim(r, 'output_image');
-  case 'input': return dim(r, 'input') + dim(r, 'input_cache_read') + dim(r, 'input_cache_write') + dim(r, 'input_image');
-  case 'output': return dim(r, 'output') + dim(r, 'output_image');
-  case 'prefill': return dim(r, 'input') + dim(r, 'input_cache_write') + dim(r, 'input_image');
-  case 'cached': return dim(r, 'input_cache_read');
-  case 'cacheCreation': return dim(r, 'input_cache_write');
+  case 'total': return sumDecimalStrings(metricQuantity(r, 'input_tokens'), metricQuantity(r, 'output_tokens'), metricQuantity(r, 'input_cache_read_tokens'), metricQuantity(r, 'input_cache_write_tokens'), metricQuantity(r, 'input_cache_write_1h_tokens'), metricQuantity(r, 'input_image_tokens'), metricQuantity(r, 'input_audio_tokens'), metricQuantity(r, 'output_image_tokens'));
+  case 'input': return sumDecimalStrings(metricQuantity(r, 'input_tokens'), metricQuantity(r, 'input_cache_read_tokens'), metricQuantity(r, 'input_cache_write_tokens'), metricQuantity(r, 'input_cache_write_1h_tokens'), metricQuantity(r, 'input_image_tokens'), metricQuantity(r, 'input_audio_tokens'));
+  case 'output': return sumDecimalStrings(metricQuantity(r, 'output_tokens'), metricQuantity(r, 'output_image_tokens'));
+  case 'prefill': return sumDecimalStrings(metricQuantity(r, 'input_tokens'), metricQuantity(r, 'input_cache_write_tokens'), metricQuantity(r, 'input_cache_write_1h_tokens'), metricQuantity(r, 'input_image_tokens'), metricQuantity(r, 'input_audio_tokens'));
+  case 'cached': return metricQuantity(r, 'input_cache_read_tokens');
+  case 'cacheCreation': return sumDecimalStrings(metricQuantity(r, 'input_cache_write_tokens'), metricQuantity(r, 'input_cache_write_1h_tokens'));
   case 'cachedRate':
   case 'cacheHitRate':
-    return 0;
+    return '0';
   }
 };
 
@@ -227,13 +262,15 @@ interface KeyMeta {
 
 interface TokenDetail {
   requests: number;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheCreation: number;
-  inputImage: number;
-  outputImage: number;
-  cost: number;
+  input: DecimalString;
+  output: DecimalString;
+  cacheRead: DecimalString;
+  cacheCreation: DecimalString;
+  inputImage: DecimalString;
+  inputAudio: DecimalString;
+  outputImage: DecimalString;
+  cost: DecimalString | null;
+  hasTokenUsage: boolean;
 }
 
 interface ChartEntry {
@@ -242,53 +279,30 @@ interface ChartEntry {
   colorSlot: number;
 }
 
-const compareKeyIds = (a: string, b: string, keyMetaMap: Map<string, KeyMeta>) => {
-  const am = keyMetaMap.get(a);
-  const bm = keyMetaMap.get(b);
-  if (am?.createdAt && bm?.createdAt && am.createdAt !== bm.createdAt) return am.createdAt.localeCompare(bm.createdAt);
-  if (am?.createdAt !== bm?.createdAt) return am?.createdAt ? -1 : 1;
-  return a.localeCompare(b);
-};
-
-const keyColorSlots = (colorOrder: readonly string[]) => {
-  const explicitSlotById = new Map<string, number>();
-  const futureSlotByIndex = new Map<number, number>();
-  let maxFutureIndex = 0;
-  for (let i = 0; i < colorOrder.length; i++) {
-    const token = colorOrder[i]!;
-    const futureMatch = token.match(/^future-(\d+)$/);
-    if (futureMatch) {
-      const futureIndex = Number(futureMatch[1]);
-      futureSlotByIndex.set(futureIndex, i);
-      maxFutureIndex = Math.max(maxFutureIndex, futureIndex);
-    } else {
-      explicitSlotById.set(token, i);
-    }
-  }
-  return { explicitSlotById, futureSlotByIndex, maxFutureIndex };
-};
-
-const futureColorSlot = (futureIndex: number, colorOrderLength: number, futureSlotByIndex: Map<number, number>, maxFutureIndex: number) =>
-  futureSlotByIndex.get(futureIndex) ?? colorOrderLength + futureIndex - maxFutureIndex - 1;
+const keySeriesIsolation = createSeriesIsolation();
+const modelSeriesIsolation = createSeriesIsolation();
+const searchSeriesIsolation = createSeriesIsolation();
 
 const keyChartEntries = (
   presentKeyIds: readonly string[],
   keyMetaMap: Map<string, KeyMeta>,
   keyIdsForOrder: readonly string[],
-  colorOrder: readonly string[],
 ): ChartEntry[] => {
-  const present = new Set(presentKeyIds);
-  const { explicitSlotById, futureSlotByIndex, maxFutureIndex } = keyColorSlots(colorOrder);
-  const futureKeyIds = [...new Set([...keyIdsForOrder, ...presentKeyIds])]
-    .filter(keyId => !explicitSlotById.has(keyId))
-    .sort((a, b) => compareKeyIds(a, b, keyMetaMap));
-  const futureSlotByKeyId = new Map(
-    futureKeyIds.map((keyId, i) => [keyId, futureColorSlot(i + 1, colorOrder.length, futureSlotByIndex, maxFutureIndex)]),
-  );
-  return [...present]
-    .map(keyId => ({ id: keyId, label: redactKeyLabel(keyMetaMap.get(keyId)?.name ?? keyId.slice(0, 8), keyId), colorSlot: explicitSlotById.get(keyId) ?? futureSlotByKeyId.get(keyId) }))
-    .filter((entry): entry is ChartEntry => entry.colorSlot !== undefined)
-    .sort((a, b) => a.colorSlot - b.colorSlot || compareKeyIds(a.id, b.id, keyMetaMap));
+  // Color slot = the entity's index in the server-sorted metadata. The server
+  // sorts by stable id (numeric for users, uuid lex for keys) so colors don't
+  // shift on rename; new entities slot in by id. Records whose id is missing
+  // from the metadata (deleted-with-no-row left a synthetic bucket) get
+  // appended after the known entries by id.
+  const slotById = new Map<string, number>(keyIdsForOrder.map((id, i) => [id, i]));
+  const orphanIds = [...new Set(presentKeyIds)].filter(id => !slotById.has(id)).sort();
+  orphanIds.forEach((id, i) => slotById.set(id, keyIdsForOrder.length + i));
+  return [...new Set(presentKeyIds)]
+    .map(id => ({
+      id,
+      label: redactKeyLabel(keyMetaMap.get(id)?.name ?? id.slice(0, 8), id),
+      colorSlot: slotById.get(id)!,
+    }))
+    .sort((a, b) => a.colorSlot - b.colorSlot);
 };
 
 const modelChartEntries = (presentModelIds: readonly string[]): ChartEntry[] => {
@@ -302,21 +316,21 @@ const modelChartEntries = (presentModelIds: readonly string[]): ChartEntry[] => 
 
 const tokenDetailMetricValue = (detail: TokenDetail, metric: Metric): number | null => {
   if (metric === 'cacheHitRate') {
-    const total = detail.cacheRead + detail.cacheCreation;
-    return total > 0 ? (detail.cacheRead / total) * 100 : null;
+    const total = sumDecimalStrings(detail.cacheRead, detail.cacheCreation);
+    return total !== '0' ? (decimalStringToChartNumber(detail.cacheRead) / decimalStringToChartNumber(total)) * 100 : null;
   }
   if (metric === 'cachedRate') {
-    const prompt = detail.input + detail.cacheRead + detail.cacheCreation + detail.inputImage;
-    return prompt > 0 ? (detail.cacheRead / prompt) * 100 : null;
+    const prompt = sumDecimalStrings(detail.input, detail.cacheRead, detail.cacheCreation, detail.inputImage, detail.inputAudio);
+    return prompt !== '0' ? (decimalStringToChartNumber(detail.cacheRead) / decimalStringToChartNumber(prompt)) * 100 : null;
   }
   return null;
 };
 
-const emptyDetail = (): TokenDetail => ({ requests: 0, input: 0, output: 0, cacheRead: 0, cacheCreation: 0, inputImage: 0, outputImage: 0, cost: 0 });
+const emptyDetail = (): TokenDetail => ({ requests: 0, input: '0', output: '0', cacheRead: '0', cacheCreation: '0', inputImage: '0', inputAudio: '0', outputImage: '0', cost: null, hasTokenUsage: false });
 
 const aggregateTokenRecords = (records: readonly DisplayUsageRecord[], groupKey: 'keyId' | 'model', metric: Metric) => {
   const { keys: bucketKeys, labels } = buckets.value;
-  const values = new Map<string, Map<string, number | null>>();
+  const values = new Map<string, Map<string, DecimalString | number | null>>();
   const details = new Map<string, Map<string, TokenDetail>>();
   for (const key of bucketKeys) {
     values.set(key, new Map());
@@ -329,17 +343,23 @@ const aggregateTokenRecords = (records: readonly DisplayUsageRecord[], groupKey:
     const bucketDetails = details.get(bucket)!;
     const detail = bucketDetails.get(group) ?? emptyDetail();
     detail.requests += r.requests;
-    detail.input += dim(r, 'input');
-    detail.output += dim(r, 'output');
-    detail.cacheRead += dim(r, 'input_cache_read');
-    detail.cacheCreation += dim(r, 'input_cache_write');
-    detail.inputImage += dim(r, 'input_image');
-    detail.outputImage += dim(r, 'output_image');
-    detail.cost += r.cost;
+    detail.input = sumDecimalStrings(detail.input, metricQuantity(r, 'input_tokens'));
+    detail.output = sumDecimalStrings(detail.output, metricQuantity(r, 'output_tokens'));
+    detail.cacheRead = sumDecimalStrings(detail.cacheRead, metricQuantity(r, 'input_cache_read_tokens'));
+    detail.cacheCreation = sumDecimalStrings(detail.cacheCreation, metricQuantity(r, 'input_cache_write_tokens'), metricQuantity(r, 'input_cache_write_1h_tokens'));
+    detail.inputImage = sumDecimalStrings(detail.inputImage, metricQuantity(r, 'input_image_tokens'));
+    detail.inputAudio = sumDecimalStrings(detail.inputAudio, metricQuantity(r, 'input_audio_tokens'));
+    detail.outputImage = sumDecimalStrings(detail.outputImage, metricQuantity(r, 'output_image_tokens'));
+    if (r.cost !== null) detail.cost = sumDecimalStrings(detail.cost ?? '0', r.cost);
+    if (r.metrics.some(row => row.metric.endsWith('_tokens'))) detail.hasTokenUsage = true;
     bucketDetails.set(group, detail);
     if (!isPercentMetric(metric)) {
       const bucketValues = values.get(bucket)!;
-      bucketValues.set(group, (bucketValues.get(group) ?? 0) + metricValue(r, metric));
+      const value = metricValue(r, metric);
+      if (value !== null) {
+        const current = bucketValues.get(group);
+        bucketValues.set(group, sumDecimalStrings(typeof current === 'string' ? current : '0', value));
+      } else if (!bucketValues.has(group)) bucketValues.set(group, null);
     }
   }
   if (isPercentMetric(metric)) {
@@ -357,7 +377,7 @@ const formatTokenChartAxisValue = (value: number, metric: Metric) => {
   const kind = TOKEN_CHART_METRICS[metric].kind;
   if (kind === 'percent') return `${value.toFixed(0)}%`;
   if (kind === 'count') return Math.round(value).toLocaleString();
-  if (kind === 'cost') return formatCost(value);
+  if (kind === 'cost') return formatChartCost(value);
   return formatTokenCount(value);
 };
 
@@ -366,16 +386,16 @@ const tooltipHeader = (labelWidth: number) =>
 
 const tooltipRow = (label: string, labelWidth: number, detail: TokenDetail) => {
   const cached = detail.cacheRead;
-  // Input/output columns mix text and image token counts; pricing already
-  // differs per dimension, so the display does not split them out.
-  const prompt = detail.input + detail.cacheRead + detail.cacheCreation + detail.inputImage;
-  const output = detail.output + detail.outputImage;
-  const total = prompt + output;
-  const prefill = detail.input + detail.cacheCreation + detail.inputImage;
-  return `${label.padEnd(labelWidth + 1)}${String(detail.requests).padStart(5)}  ${formatCost(detail.cost).padStart(9)}  ${formatTokenCount(total).padStart(7)}  ${formatTokenCount(cached).padStart(7)}  ${formatInputRate(cached, prompt).padStart(8)}  ${formatTokenCount(prefill).padStart(7)}  ${formatTokenCount(output).padStart(7)}  ${formatHitRate(detail.cacheRead, detail.cacheCreation).padStart(7)}`;
+  const prompt = sumDecimalStrings(detail.input, detail.cacheRead, detail.cacheCreation, detail.inputImage, detail.inputAudio);
+  const output = sumDecimalStrings(detail.output, detail.outputImage);
+  const total = sumDecimalStrings(prompt, output);
+  const prefill = sumDecimalStrings(detail.input, detail.cacheCreation, detail.inputImage, detail.inputAudio);
+  const cost = formatUsd(detail.cost);
+  const tokenCount = (value: DecimalString) => detail.hasTokenUsage ? formatTokenCount(decimalStringToChartNumber(value)) : '—';
+  return `${label.padEnd(labelWidth + 1)}${String(detail.requests).padStart(5)}  ${cost.padStart(9)}  ${tokenCount(total).padStart(7)}  ${tokenCount(cached).padStart(7)}  ${formatInputRate(cached, prompt).padStart(8)}  ${tokenCount(prefill).padStart(7)}  ${tokenCount(output).padStart(7)}  ${formatHitRate(detail.cacheRead, detail.cacheCreation).padStart(7)}`;
 };
 
-const keyMetadataForTokenRecords = (records: readonly DisplayUsageRecord[], metadata: readonly { id: string; name: string; createdAt: string }[]) => {
+const keyMetadataForTokenRecords = (records: readonly DisplayUsageRecord[], metadata: readonly { id: string; name: string; createdAt?: string }[]) => {
   const map = new Map<string, KeyMeta>();
   for (const key of metadata) map.set(key.id, { name: key.name, createdAt: key.createdAt });
   for (const record of records) {
@@ -400,15 +420,32 @@ const buildStackedConfig = (groupKey: 'keyId' | 'model'): ChartConfiguration<'li
   // color no matter how cross-filtering changes which groups remain.
   const presentGroups = new Set(allRecords.map(r => r[groupKey]));
   const entries = groupKey === 'keyId'
-    ? keyChartEntries([...presentGroups], keyMetadataForTokenRecords(allRecords, data.value?.keys ?? []), data.value?.keys.map(k => k.id) ?? [...presentGroups], data.value?.keyColorOrder ?? [])
+    ? keyChartEntries([...presentGroups], keyMetadataForTokenRecords(allRecords, data.value?.keys ?? []), data.value?.keys.map(k => k.id) ?? [...presentGroups])
     : modelChartEntries([...presentGroups]);
-  // Cross-filtering can leave a group with all-zero (or, for percent metrics,
-  // all-null) values. Drop those datasets outright — legend entry and line both
-  // gone — instead of rendering an inert flat line. The own-dimension hidden set
-  // is a separate, restorable user toggle and keeps its struck-through entry.
+  // A group can hold all-zero or all-null values under the current metric for
+  // two distinct reasons, and requests tells them apart:
+  // cross-filtering that emptied the group leaves requests at zero too (details
+  // aggregate the same cross-filtered records), whereas a group with real but
+  // zero-token traffic still has requests > 0, while unavailable pricing is
+  // represented by null. Keep both groups in the legend; drop groups emptied
+  // by cross-filtering instead. Own-
+  // dimension hidden groups are a separate, restorable toggle kept struck-through.
+  // Percent metrics stay null-only: a ratio over zero tokens is undefined.
+  //
+  // Missing buckets fall back to zero for continuous stacks; an explicit null
+  // remains null so unavailable cost never becomes a measured zero.
+  const hasRequests = (id: string) => bucketKeys.some(k => (details.get(k)?.get(id)?.requests ?? 0) > 0);
   const datasetEntries = entries
-    .map(entry => ({ entry, data: bucketKeys.map(k => values.get(k)?.get(entry.id) ?? (isPercent ? null : 0)) }))
-    .filter(({ data }) => isPercent ? data.some(v => v !== null) : data.some(v => v !== 0));
+    .map(entry => ({
+      entry,
+      data: bucketKeys.map(k => {
+        const bucketValues = values.get(k)!;
+        const value = bucketValues.has(entry.id) ? bucketValues.get(entry.id)! : (isPercent ? null : '0');
+        if (value === null || typeof value === 'number') return value;
+        return decimalStringToChartNumber(value);
+      }),
+    }))
+    .filter(({ entry, data }) => isPercent ? data.some(v => v !== null) : (data.some(v => v !== 0) || hasRequests(entry.id)));
   const labelWidth = datasetEntries.reduce((max, { entry }) => Math.max(max, entry.label.length), 0);
   return {
     type: 'line',
@@ -416,8 +453,16 @@ const buildStackedConfig = (groupKey: 'keyId' | 'model'): ChartConfiguration<'li
       labels,
       datasets: datasetEntries.map(({ entry, data: datasetData }) => {
         const color = chartColor(entry.colorSlot);
+        // A dataset kept only because its group has real requests — every
+        // selected-metric value is zero — would, when stacked onto the series
+        // below it, ride invisibly along that series' top edge rather than sit
+        // at zero. Give it a private stack group and drop the fill so it draws
+        // as a flat, hoverable line pinned to the axis. It contributes nothing
+        // to the main stack, so pulling it out leaves the real totals untouched.
+        const zeroLine = !isPercent && !datasetData.some(v => v !== 0);
         return {
           label: entry.label,
+          seriesId: entry.id,
           data: datasetData,
           hidden: ownHidden.value.has(entry.id),
           borderColor: color,
@@ -426,8 +471,13 @@ const buildStackedConfig = (groupKey: 'keyId' | 'model'): ChartConfiguration<'li
           pointRadius: 2,
           pointHoverRadius: 5,
           tension: 0.3,
-          fill: isPercent ? false : 'stack',
+          fill: isPercent || zeroLine ? false : 'stack',
           spanGaps: isPercent,
+          stack: zeroLine ? 'axis' : 'main',
+          // Zero-line series draw at y=0 and get painted over by any main-stack
+          // area whose bottom sits at the axis; render them last (lower `order`
+          // = drawn on top) so their flat line and points stay visible.
+          order: zeroLine ? -1 : 0,
         };
       }),
     },
@@ -440,9 +490,10 @@ const buildStackedConfig = (groupKey: 'keyId' | 'model'): ChartConfiguration<'li
         legend: {
           position: 'bottom',
           labels: { color: '#9e9e9e', font: { size: 11, family: chartFont.sans }, boxWidth: 12, padding: 16, usePointStyle: true, pointStyle: 'circle' },
-          onClick: (_event, legendItem) => {
-            const entry = datasetEntries[legendItem.datasetIndex ?? -1]?.entry;
-            if (entry) toggleHidden(ownHidden.value, entry.id);
+          onClick: (event, legendItem) => {
+            const entry = datasetEntries[legendItem.datasetIndex!].entry;
+            const isolation = groupKey === 'keyId' ? keySeriesIsolation : modelSeriesIsolation;
+            handleLegendClick(event, isolation, ownHidden.value, datasetEntries.map(({ entry }) => entry.id), entry.id);
           },
         },
         tooltip: {
@@ -453,7 +504,19 @@ const buildStackedConfig = (groupKey: 'keyId' | 'model'): ChartConfiguration<'li
           bodyColor: '#b0bec5',
           padding: 12,
           bodyFont: { family: chartFont.mono, size: 11 },
-          filter: item => item.parsed.y !== null && (isPercent || item.parsed.y > 0),
+          // Null y = no record in this bucket (dropped). A stacked-dataset zero
+          // may be either a real zero-token record or a synthesized fill for a
+          // no-record bucket — the latter must not appear in the tooltip, so
+          // reach back into `details.requests` to keep only rows where the
+          // group actually served requests.
+          filter: item => {
+            if (item.parsed.y === null) return false;
+            if (isPercent || item.parsed.y > 0) return true;
+            const bucket = bucketKeys[item.dataIndex];
+            const entry = datasetEntries[item.datasetIndex]?.entry;
+            return bucket !== undefined && entry !== undefined
+              && (details.get(bucket)?.get(entry.id)?.requests ?? 0) > 0;
+          },
           itemSort: (a, b) => Number(b.parsed.y ?? 0) - Number(a.parsed.y ?? 0),
           callbacks: {
             beforeBody: items => items.length ? tooltipHeader(labelWidth) : [],
@@ -490,6 +553,8 @@ const buildStackedConfig = (groupKey: 'keyId' | 'model'): ChartConfiguration<'li
 
 const byKeyConfig = computed(() => buildStackedConfig('keyId'));
 const byModelConfig = computed(() => buildStackedConfig('model'));
+const byKeySeriesIds = computed(() => chartSeriesIds(byKeyConfig.value));
+const byModelSeriesIds = computed(() => chartSeriesIds(byModelConfig.value));
 
 const searchUsageActiveProvider = computed(() => {
   return searchData.value?.activeProvider ?? 'disabled';
@@ -512,7 +577,7 @@ const searchByKeyConfig = computed<ChartConfiguration<'line'>>(() => {
     groups.set(r.keyId, inner);
     presentGroups.add(r.keyId);
   }
-  const entries = keyChartEntries([...presentGroups], meta, searchData.value?.keys.map(k => k.id) ?? [...presentGroups], searchData.value?.keyColorOrder ?? []);
+  const entries = keyChartEntries([...presentGroups], meta, searchData.value?.keys.map(k => k.id) ?? [...presentGroups]);
   return {
     type: 'line',
     data: {
@@ -521,6 +586,7 @@ const searchByKeyConfig = computed<ChartConfiguration<'line'>>(() => {
         const color = chartColor(entry.colorSlot);
         return {
           label: entry.label,
+          seriesId: entry.id,
           data: bucketKeys.map(k => groups.get(entry.id)?.get(k) ?? 0),
           hidden: hiddenKeys.value.has(entry.id),
           borderColor: color,
@@ -543,9 +609,9 @@ const searchByKeyConfig = computed<ChartConfiguration<'line'>>(() => {
         legend: {
           position: 'bottom',
           labels: { color: '#9e9e9e', font: { size: 11, family: chartFont.sans }, boxWidth: 12, padding: 16, usePointStyle: true, pointStyle: 'circle' },
-          onClick: (_event, legendItem) => {
-            const entry = entries[legendItem.datasetIndex ?? -1];
-            if (entry) toggleHidden(hiddenKeys.value, entry.id);
+          onClick: (event, legendItem) => {
+            const entry = entries[legendItem.datasetIndex!];
+            handleLegendClick(event, searchSeriesIsolation, hiddenKeys.value, entries.map(entry => entry.id), entry.id);
           },
         },
         tooltip: {
@@ -568,7 +634,10 @@ const searchByKeyConfig = computed<ChartConfiguration<'line'>>(() => {
   };
 });
 
-const formatCost = (v: number) => {
+const searchByKeySeriesIds = computed(() => chartSeriesIds(searchByKeyConfig.value));
+
+const formatChartCost = (v: number | null) => {
+  if (v === null) return '—';
   if (v >= 1) return `$${v.toFixed(2)}`;
   if (v >= 0.01) return `$${v.toFixed(3)}`;
   if (v > 0) return `$${v.toFixed(4)}`;
@@ -581,11 +650,25 @@ const formatCost = (v: number) => {
     <div class="glass-card p-6 animate-in">
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
         <div class="flex items-center gap-3">
-          <span class="text-xs font-medium text-gray-500 uppercase tracking-widest">Token Usage — By Key</span>
+          <span class="text-xs font-medium text-gray-500 uppercase tracking-widest">Token Usage</span>
+          <div v-if="auth.isAdmin" class="inline-flex rounded-md bg-surface-800 p-0.5" role="tablist">
+            <button
+              type="button"
+              class="px-2 py-1 text-[11px] font-medium rounded transition-colors"
+              :class="view === 'all-by-user' ? 'bg-surface-600 text-white' : 'text-gray-500 hover:text-gray-300'"
+              @click="view = 'all-by-user'"
+            >All by user</button>
+            <button
+              type="button"
+              class="px-2 py-1 text-[11px] font-medium rounded transition-colors"
+              :class="view === 'self-by-key' ? 'bg-surface-600 text-white' : 'text-gray-500 hover:text-gray-300'"
+              @click="view = 'self-by-key'"
+            >My keys</button>
+          </div>
           <button
             class="inline-flex min-h-9 min-w-9 items-center justify-center rounded-md p-1 transition-colors text-gray-600 hover:text-gray-400 hover:bg-white/[0.04]"
-            aria-label="Toggle key name redaction"
-            title="Redact key names"
+            :aria-label="view === 'all-by-user' ? 'Toggle user name redaction' : 'Toggle key name redaction'"
+            :title="view === 'all-by-user' ? 'Redact usernames' : 'Redact key names'"
             @click="redactKeys = !redactKeys"
           >
             <svg v-if="!redactKeys" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -617,12 +700,18 @@ const formatCost = (v: number) => {
         </OverlayScrollbars>
       </div>
 
+      <div class="mb-2 flex justify-end">
+        <ChartSeriesControls label="Token usage series selection" @select="applySeriesSelection(hiddenKeys, byKeySeriesIds, $event)" />
+      </div>
       <div style="height: 320px; position: relative;">
         <ChartCanvas :config="byKeyConfig" />
       </div>
 
       <div class="mt-6 pt-5 border-t border-white/5">
-        <span class="text-xs font-medium text-gray-500 uppercase tracking-widest mb-4 block">By Model</span>
+        <div class="flex items-center justify-between gap-3 mb-4">
+          <span class="text-xs font-medium text-gray-500 uppercase tracking-widest block">By Model</span>
+          <ChartSeriesControls label="Model usage series selection" @select="applySeriesSelection(hiddenModels, byModelSeriesIds, $event)" />
+        </div>
         <div style="height: 320px; position: relative;">
           <ChartCanvas :config="byModelConfig" />
         </div>
@@ -631,30 +720,33 @@ const formatCost = (v: number) => {
       <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mt-6 pt-5 border-t border-white/5">
         <div class="grid grid-cols-2 lg:grid-cols-1 gap-2">
           <UsageSummaryMetric metric="requests" label="Requests" :active="tokenChartMetric === 'requests'" :value="tokenSummary.requests.toLocaleString()" @select="switchTokenChartMetric" />
-          <UsageSummaryMetric metric="cost" label="Est. Cost" :active="tokenChartMetric === 'cost'" :value="formatCost(tokenSummary.cost)" @select="switchTokenChartMetric" />
+          <UsageSummaryMetric metric="cost" label="Est. Cost" :active="tokenChartMetric === 'cost'" :value="formatUsd(tokenSummary.cost)" @select="switchTokenChartMetric" />
         </div>
         <div class="grid grid-cols-2 lg:grid-cols-1 gap-2">
-          <UsageSummaryMetric metric="total" label="Total Tokens" :active="tokenChartMetric === 'total'" :value="tokenSummary.total.toLocaleString()" @select="switchTokenChartMetric" />
-          <UsageSummaryMetric metric="output" label="Output Tokens" :active="tokenChartMetric === 'output'" :value="tokenSummary.output.toLocaleString()" @select="switchTokenChartMetric" />
+          <UsageSummaryMetric metric="total" label="Total Tokens" :active="tokenChartMetric === 'total'" :value="formatDecimalQuantity(tokenSummary.total)" @select="switchTokenChartMetric" />
+          <UsageSummaryMetric metric="output" label="Output Tokens" :active="tokenChartMetric === 'output'" :value="formatDecimalQuantity(tokenSummary.output)" @select="switchTokenChartMetric" />
         </div>
         <div class="grid grid-cols-2 lg:grid-cols-1 gap-2">
-          <UsageSummaryMetric metric="input" label="Input Tokens" :active="tokenChartMetric === 'input'" :value="tokenSummary.input.toLocaleString()" @select="switchTokenChartMetric" />
-          <UsageSummaryMetric metric="prefill" label="Prefill Input" :active="tokenChartMetric === 'prefill'" :value="tokenSummary.prefill.toLocaleString()" @select="switchTokenChartMetric" />
+          <UsageSummaryMetric metric="input" label="Input Tokens" :active="tokenChartMetric === 'input'" :value="formatDecimalQuantity(tokenSummary.input)" @select="switchTokenChartMetric" />
+          <UsageSummaryMetric metric="prefill" label="Prefill Input" :active="tokenChartMetric === 'prefill'" :value="formatDecimalQuantity(tokenSummary.prefill)" @select="switchTokenChartMetric" />
         </div>
         <div class="grid grid-cols-2 lg:grid-cols-1 gap-2">
-          <UsageSummaryMetric metric="cached" label="Cached Input" :active="tokenChartMetric === 'cached'" :value="tokenSummary.cacheRead.toLocaleString()" @select="switchTokenChartMetric" />
+          <UsageSummaryMetric metric="cached" label="Cached Input" :active="tokenChartMetric === 'cached'" :value="formatDecimalQuantity(tokenSummary.cacheRead)" @select="switchTokenChartMetric" />
           <UsageSummaryMetric metric="cachedRate" label="Cached Rate" :active="tokenChartMetric === 'cachedRate'" :value="formatInputRate(tokenSummary.cacheRead, tokenSummary.input)" @select="switchTokenChartMetric" />
         </div>
         <div class="grid grid-cols-2 lg:grid-cols-1 gap-2">
-          <UsageSummaryMetric metric="cacheCreation" label="Cache Write" :active="tokenChartMetric === 'cacheCreation'" :value="tokenSummary.cacheCreation.toLocaleString()" @select="switchTokenChartMetric" />
+          <UsageSummaryMetric metric="cacheCreation" label="Cache Write" :active="tokenChartMetric === 'cacheCreation'" :value="formatDecimalQuantity(tokenSummary.cacheCreation)" @select="switchTokenChartMetric" />
           <UsageSummaryMetric metric="cacheHitRate" label="Cache Hit Rate" :active="tokenChartMetric === 'cacheHitRate'" :value="formatHitRate(tokenSummary.cacheRead, tokenSummary.cacheCreation)" @select="switchTokenChartMetric" />
         </div>
       </div>
 
       <div v-if="searchUsageActiveProvider !== 'disabled'" class="mt-6 pt-5 border-t border-white/5">
-        <div class="flex items-center gap-3 mb-4">
-          <span class="text-xs font-medium text-gray-500 uppercase tracking-widest block">Search Usage — Per Key</span>
-          <Spinner v-if="searchUsageLoading" class="h-3.5 w-3.5 text-gray-500" />
+        <div class="flex items-center justify-between gap-3 mb-4">
+          <div class="flex items-center gap-3">
+            <span class="text-xs font-medium text-gray-500 uppercase tracking-widest block">Search Usage</span>
+            <Spinner v-if="searchUsageLoading" class="h-3.5 w-3.5 text-gray-500" />
+          </div>
+          <ChartSeriesControls label="Search usage series selection" @select="applySeriesSelection(hiddenKeys, searchByKeySeriesIds, $event)" />
         </div>
         <div style="height: 320px; position: relative;">
           <ChartCanvas :config="searchByKeyConfig" />

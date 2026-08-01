@@ -12,7 +12,8 @@ import {
   type GeminiToolCallIds,
   geminiVisibleText,
 } from '../shared/gemini-via/gemini.ts';
-import { applyLastMessageCacheBreakpoint, applyLastToolCacheBreakpoint, EPHEMERAL_CACHE_CONTROL } from '../shared/via-messages/cache-breakpoints.ts';
+import { applyLastMessageCacheBreakpoint, applyLastSystemCacheBreakpoint, applyLastToolCacheBreakpoint } from '../shared/via-messages/cache-breakpoints.ts';
+import { TranslatorInputError } from '../translator-input-error.ts';
 import type { GeminiContent, GeminiPayload, GeminiGenerationConfig, GeminiPart, GeminiThinkingConfig } from '@floway-dev/protocols/gemini';
 import {
   MESSAGES_FALLBACK_MAX_TOKENS,
@@ -66,7 +67,7 @@ const buildUserMessage = (content: GeminiContent, turnIndex: number, unmatchedTo
       return;
     }
     default:
-      throw new Error(`Gemini → Messages translator does not accept ${kind} parts in user content.`);
+      throw new TranslatorInputError(`"${kind}" parts are not supported in user content.`);
     }
   });
 
@@ -136,7 +137,7 @@ const buildAssistantMessage = (content: GeminiContent, turnIndex: number, unmatc
       return;
     }
     default:
-      throw new Error(`Gemini → Messages translator does not accept ${kind} parts in model content.`);
+      throw new TranslatorInputError(`"${kind}" parts are not supported in model content.`);
     }
   });
 
@@ -145,33 +146,37 @@ const buildAssistantMessage = (content: GeminiContent, turnIndex: number, unmatc
   return blocks.length ? { role: 'assistant', content: blocks } : null;
 };
 
-const applyThinkingConfig = (request: MessagesPayload, thinkingConfig?: GeminiThinkingConfig): void => {
-  if (!thinkingConfig) return;
+interface ThinkingConfigFields {
+  thinking?: NonNullable<MessagesPayload['thinking']>;
+  outputConfig: NonNullable<MessagesPayload['output_config']>;
+}
 
-  if (thinkingConfig.thinkingBudget !== undefined) {
-    if (thinkingConfig.thinkingBudget === -1) {
-      request.thinking = { type: 'adaptive' };
-    } else if (thinkingConfig.thinkingBudget > 0) {
-      request.thinking = {
-        type: 'enabled',
-        budget_tokens: thinkingConfig.thinkingBudget,
-      };
-    } else if (thinkingConfig.thinkingBudget === 0) {
-      request.thinking = { type: 'disabled' };
-    }
+const applyThinkingConfig = (thinkingConfig?: GeminiThinkingConfig): ThinkingConfigFields => {
+  if (!thinkingConfig) return { outputConfig: {} };
+
+  let thinking: ThinkingConfigFields['thinking'];
+  if (thinkingConfig.thinkingBudget === -1) {
+    thinking = { type: 'adaptive' };
+  } else if (thinkingConfig.thinkingBudget !== undefined && thinkingConfig.thinkingBudget > 0) {
+    thinking = {
+      type: 'enabled',
+      budget_tokens: thinkingConfig.thinkingBudget,
+    };
+  } else if (thinkingConfig.thinkingBudget === 0) {
+    thinking = { type: 'disabled' };
   }
 
   const effort = geminiThinkingLevelEffort(thinkingConfig);
-  // Spread to merge with any output_config fields a sibling helper has
-  // already written (e.g. structured-output `format` from
-  // applyGenerationConfig).
-  if (effort !== undefined) request.output_config = { ...request.output_config, effort };
+  return {
+    ...(thinking !== undefined ? { thinking } : {}),
+    outputConfig: effort !== undefined ? { effort } : {},
+  };
 };
 
-const applyGenerationConfig = (request: MessagesPayload, generationConfig: GeminiGenerationConfig | undefined, fallbackMaxOutputTokens: number): void => {
+const applyGenerationConfig = (request: MessagesPayload, generationConfig: GeminiGenerationConfig | undefined, fallbackMaxOutputTokens: number): NonNullable<MessagesPayload['output_config']> => {
   request.max_tokens = generationConfig?.maxOutputTokens ?? fallbackMaxOutputTokens;
 
-  if (!generationConfig) return;
+  if (!generationConfig) return {};
 
   if (generationConfig.temperature !== undefined) {
     request.temperature = generationConfig.temperature;
@@ -189,14 +194,9 @@ const applyGenerationConfig = (request: MessagesPayload, generationConfig: Gemin
   // as `output_config.format = { type: 'json_schema', schema }`. `responseMimeType:
   // application/json` without a schema has no Anthropic equivalent and is
   // dropped — the routing fallback degrades gracefully rather than fails.
-  if (generationConfig.responseSchema !== undefined) {
-    request.output_config = {
-      ...request.output_config,
-      format: { type: 'json_schema', schema: generationConfig.responseSchema as Record<string, unknown> },
-    };
-  }
-
-  applyThinkingConfig(request, generationConfig.thinkingConfig);
+  return generationConfig.responseSchema !== undefined
+    ? { format: { type: 'json_schema', schema: generationConfig.responseSchema as Record<string, unknown> } }
+    : {};
 };
 
 const inputSchemaForDeclaration = (parameters: Record<string, unknown> | undefined): Record<string, unknown> => {
@@ -225,8 +225,8 @@ export const buildTargetRequest = (
 ): MessagesPayload => {
   // Gemini can omit maxOutputTokens, but MessagesPayload requires max_tokens.
   // Prefer the model's advertised `/models` cap when one is known; otherwise
-  // fall back to the gateway policy default shared with the other *-to-Messages
-  // translators.
+  // fall back to the gateway policy default shared with the other
+  // `*-via-messages` translators.
   const fallbackMaxOutputTokens = options.fallbackMaxOutputTokens ?? MESSAGES_FALLBACK_MAX_TOKENS;
   const request: MessagesPayload = {
     model,
@@ -238,8 +238,9 @@ export const buildTargetRequest = (
 
   const system = geminiText(payload.systemInstruction);
   if (system !== null) {
-    const systemBlock: MessagesTextBlock = { type: 'text', text: system, cache_control: EPHEMERAL_CACHE_CONTROL };
-    request.system = [systemBlock];
+    const systemBlocks: MessagesTextBlock[] = [{ type: 'text', text: system }];
+    applyLastSystemCacheBreakpoint(systemBlocks);
+    request.system = systemBlocks;
   }
 
   payload.contents?.forEach((content, turnIndex) => {
@@ -253,12 +254,24 @@ export const buildTargetRequest = (
       message = buildUserMessage(content, turnIndex, unmatchedToolCallIds);
       break;
     default:
-      throw new Error(`Gemini → Messages translator does not accept ${(content as { role: string }).role} content roles.`);
+      throw new TranslatorInputError(`"${(content as { role: string }).role}" is not a supported content role.`);
     }
     if (message) request.messages.push(message);
   });
 
-  applyGenerationConfig(request, payload.generationConfig, fallbackMaxOutputTokens);
+  const generationOutputConfig = applyGenerationConfig(request, payload.generationConfig, fallbackMaxOutputTokens);
+  const { thinking, outputConfig: thinkingOutputConfig } = applyThinkingConfig(payload.generationConfig?.thinkingConfig);
+  const outputConfig = { ...generationOutputConfig, ...thinkingOutputConfig };
+  const hasGenerationOutputConfig = Object.keys(generationOutputConfig).length > 0;
+  const attachOutputConfig = (): void => {
+    request.output_config = outputConfig;
+  };
+
+  // Preserve request-key insertion order: a structured-output format precedes
+  // `thinking`, while an effort-only `output_config` follows it.
+  if (hasGenerationOutputConfig) attachOutputConfig();
+  if (thinking !== undefined) request.thinking = thinking;
+  if (!hasGenerationOutputConfig && Object.keys(outputConfig).length > 0) attachOutputConfig();
 
   const tools = buildTools(payload);
   if (tools) request.tools = tools;

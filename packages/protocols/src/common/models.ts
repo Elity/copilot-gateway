@@ -1,79 +1,75 @@
-// Disjoint billing dimensions a single request can be charged on. Every count
-// keyed by these is non-overlapping: a prompt token is counted under exactly
-// one of `input`, `input_cache_read`, `input_cache_write`, or `input_image`,
-// never several at once.
-//
-// Convention borrowed from models.dev and LiteLLM: bare `input`/`output` mean
-// the text modality AND act as the fallback rate for any modality without a
-// dedicated rate; the `_image` variants are the image modality. There are no
-// image cache dimensions on purpose — a live probe of Azure gpt-image-2
-// confirmed its usage object never emits cached fields.
-export type BillingDimension = 'input' | 'input_cache_read' | 'input_cache_write' | 'input_image' | 'output' | 'output_image';
+import type { AliasSelection, AliasTarget } from './aliases.ts';
+import type { ModelEndpoints, ModelKind } from './endpoints.ts';
+import type { ModelPricing } from './pricing.ts';
 
-// Per-model pricing in USD per million tokens, aligned with the sst/models.dev
-// `Cost` schema (https://github.com/sst/models.dev/blob/main/packages/core/src/schema.ts).
-// Keys are billing dimensions: bare `input`/`output` are the text/fallback rate
-// and `_image` keys are the image modality. Every key is optional; an absent key
-// falls back per `unitPriceForDimension` (modality → bare, cached → uncached).
-export type ModelPricing = Partial<Record<BillingDimension, number>>;
+export const RERANK_PROTOCOLS = [
+  'cohere-v1',
+  'cohere-v2',
+  'jina-v1',
+  'voyage-v1',
+  'dashscope-compatible',
+  'dashscope-native',
+] as const;
 
-// Resolve the USD-per-million-tokens unit price for one dimension against a
-// pricing snapshot, applying the LiteLLM-style fallback chain: a modality with
-// no dedicated rate falls back to the bare text rate, and cached input falls
-// back to uncached input. Returns null when even the fallback base is absent
-// (or the whole snapshot is null), which aggregation treats as cost 0.
-export const unitPriceForDimension = (pricing: ModelPricing | null, dimension: BillingDimension): number | null => {
-  if (!pricing) return null;
-  switch (dimension) {
-  case 'input':
-    return pricing.input ?? null;
-  case 'input_cache_read':
-    return pricing.input_cache_read ?? pricing.input ?? null;
-  case 'input_cache_write':
-    return pricing.input_cache_write ?? pricing.input ?? null;
-  case 'input_image':
-    return pricing.input_image ?? pricing.input ?? null;
-  case 'output':
-    return pricing.output ?? null;
-  case 'output_image':
-    return pricing.output_image ?? pricing.output ?? null;
-  }
-};
+export type RerankProtocol = typeof RERANK_PROTOCOLS[number];
+export type RerankSourceProtocol = Exclude<RerankProtocol, 'dashscope-compatible' | 'dashscope-native'>;
 
-// High-level endpoint-family discriminator. A model belongs to exactly one
-// kind; cross-cutting features (vision, function calling, structured
-// outputs) are orthogonal and modeled separately when needed.
-//
-// Convention borrowed from Together AI's `type` field on /v1/models, which
-// chooses a single string enum because each model id in practice maps to
-// one endpoint family. We renamed `type` to `kind` to avoid colliding with
-// Anthropic's `type: 'model'` object discriminator already on PublicModel.
-//
-// Together AI's live /v1/models is known to emit at least these values:
-//
-//   chat        — instruction-tuned chat models (vision LLMs are also `chat`)
-//   language    — base / text-completion models
-//   code        — code-completion models
-//   image       — text-to-image AND image-to-image (one type, switched by
-//                 presence of an input image in the request)
-//   embedding   — vector embedding models
-//   moderation  — Llama-Guard-style classifiers (routed via /v1/completions)
-//   rerank      — query/document re-rankers
-//   audio       — text-to-speech models
-//   transcribe  — speech-to-text models
-//   video       — text-to-video models
-//
-// This list is open-ended and has grown reactively: Together's published
-// OpenAPI schema still lists only the first 7, but the live API has
-// emitted at least `audio`, `transcribe`, and `video` in production, each
-// landing in the official together-python SDK only after response
-// validation broke downstream (PRs #241, #341, #383). New values may
-// appear at any time.
-//
-// We adopt the same vocabulary because the names are already established
-// in the ecosystem. Add a value here only when we actually route that
-// endpoint family — do not pre-declare for future capabilities.
-export type ModelKind = 'chat' | 'embedding' | 'image';
+// Rerank has no vendor-neutral upstream URL. The operator chooses the wire
+// protocol on each model and may replace that protocol's canonical path for a
+// compatible server. Keeping this off the upstream prevents one model's
+// protocol choice from leaking onto every other model at the same base URL.
+export interface RerankTarget {
+  protocol: RerankProtocol;
+  path?: string;
+}
+
+export type Modality = 'text' | 'image';
+
+// Chat capability metadata for one model. Providers that can read it off the
+// raw upstream catalog fill it themselves; elsewhere it comes from the
+// operator's model config. Lives in protocols because it flows verbatim onto
+// PublicModel.chat (the wire DTO) and is also re-exported by
+// @floway-dev/provider as UpstreamChatModelConfig for the catalog side; one
+// definition serves both surfaces.
+export interface ChatModelInfo {
+  modalities?: {
+    input: readonly Modality[];
+    output: readonly Modality[];
+  };
+  reasoning?: {
+    // Discrete effort levels — a closed set of named presets (e.g. low/medium/high).
+    effort?: { supported: readonly string[]; default: string };
+    // Operator-supplied token budget. Bounds are optional; absent bounds mean
+    // "operator can supply a budget, but legal range is unknown".
+    budget_tokens?: { min?: number; max?: number };
+    // Model-controlled adaptive depth — the model decides how much reasoning to do.
+    adaptive?: boolean;
+    // Always-on reasoning — the model cannot be instructed to skip it.
+    mandatory?: boolean;
+  };
+}
+
+// Alias provenance attached to a `/v1/models` entry that the gateway
+// synthesized from an operator-defined alias rather than fetched from an
+// upstream catalog. `targets` is the configured target list — projected
+// as-is on admin surfaces and filtered to the caller-reachable subset on
+// data-plane / non-admin surfaces. The alias's `kind` and `name` live on
+// the enclosing `PublicModel` (`kind`, `id`); every alias-synthesized row
+// puts the alias name on its outer `id` and the alias kind on its outer
+// `kind`, so the sidecar avoids duplicating them.
+export interface PublicModelAliasedFrom {
+  selection: AliasSelection;
+  targets: AliasTarget[];
+}
+
+// Operator-set context-window / prompt / output token limits the gateway
+// surfaces on /v1/models. Pure data — every field is optional so a
+// partially-known upstream still produces a sensible row.
+export interface PublicModelLimits {
+  max_output_tokens?: number;
+  max_context_window_tokens?: number;
+  max_prompt_tokens?: number;
+}
 
 // Public DTO served at /v1/models and /models. Single superset shape — OpenAI's
 // and Anthropic's /models field names do not overlap, so one payload satisfies
@@ -89,13 +85,34 @@ export interface PublicModel {
   display_name: string;
   created_at?: string;
   // Non-standard extra fields below.
-  limits: {
-    max_output_tokens?: number;
-    max_context_window_tokens?: number;
-    max_prompt_tokens?: number;
-  };
+  limits: PublicModelLimits;
   kind: ModelKind;
-  cost?: ModelPricing;
+  // The merged upstream wire surface: the union of the endpoint keys the
+  // contributing upstreams expose natively, and on an alias-synthesized row
+  // the union across the alias's currently-available targets, so every key
+  // advertised here is served natively by at least one of them. It is not a
+  // list of client-callable Floway routes. Translation widens the callable
+  // chat surface past the listed keys — a chat source protocol reaches any
+  // candidate carrying one of its preferred chat targets, and Gemini has no
+  // key of its own at all. The non-chat keys (`completions`, `embeddings`,
+  // `imagesGenerations`, `imagesEdits`, `rerank`, `audioTranscriptions`) are
+  // callable exactly where they appear.
+  endpoints: ModelEndpoints;
+  pricing?: ModelPricing;
+  chat?: ChatModelInfo;
+  // Present only on entries the gateway synthesized from an operator-defined
+  // alias; absent for entries that came from an upstream catalog.
+  aliasedFrom?: PublicModelAliasedFrom;
+  // Sidecar flag carried only on entries that are addressable-but-not-
+  // listed: ids the data plane accepts (via `modelPrefix.addressable`
+  // alternates) but that do NOT appear in the default `/v1/models`
+  // payload. Absent on every default-listed row and on alias rows — both
+  // are part of the public catalog. The field surfaces only on
+  // `/api/models?include_unlisted=true` rows that the dashboard's alias
+  // edit combobox shows alongside the listed catalog. Wire shape is
+  // intentionally `unlisted?: true` — boolean would add a wire byte to
+  // every listed row for no caller benefit.
+  unlisted?: true;
 }
 
 export interface PublicModelsResponse {

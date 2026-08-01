@@ -1,0 +1,37 @@
+import type { Hono } from 'hono';
+
+import { mountAlphaSearchRoutes } from './alpha-search/routes.ts';
+import { audioTranscriptions } from './audio/http.ts';
+import { mountChatRoutes } from './chat/routes.ts';
+import { mountCodexRoutes } from './codex/routes.ts';
+import { completions } from './completions/http.ts';
+import { embeddings } from './embeddings/http.ts';
+import { imagesEdits, imagesGenerations } from './images/http.ts';
+import { serveGeminiModelInfo, serveGeminiModels } from './models/gemini.ts';
+import { serveModels } from './models/http.ts';
+import { rerank } from './rerank/serve.ts';
+import type { AuthVars } from '../middleware/auth.ts';
+
+export const mountDataPlane = (app: Hono<{ Variables: AuthVars }>) => {
+  mountAlphaSearchRoutes(app);
+  mountChatRoutes(app);
+  mountCodexRoutes(app);
+
+  app.get('/v1/models', serveModels);
+  app.get('/models', serveModels);
+  app.get('/v1beta/models', serveGeminiModels);
+  app.get('/v1beta/models/:modelId{.+}', serveGeminiModelInfo);
+  app.post('/v1/embeddings', embeddings);
+  app.post('/embeddings', embeddings);
+  app.post('/v1/completions', completions);
+  app.post('/completions', completions);
+  app.post('/v1/images/generations', imagesGenerations);
+  app.post('/images/generations', imagesGenerations);
+  app.post('/v1/images/edits', imagesEdits);
+  app.post('/images/edits', imagesEdits);
+  app.post('/v1/audio/transcriptions', audioTranscriptions);
+  app.post('/v1/rerank', rerank('cohere-v1'));
+  app.post('/v2/rerank', rerank('cohere-v2'));
+  app.post('/jina/v1/rerank', rerank('jina-v1'));
+  app.post('/voyage/v1/rerank', rerank('voyage-v1'));
+};

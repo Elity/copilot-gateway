@@ -3,4 +3,5 @@ packages:
   - apps/*
 
 patchedDependencies:
-  overlayscrollbars: patches/overlayscrollbars.patch
+  '@reclaimprotocol/tls@0.1.2': patches/@reclaimprotocol__tls@0.1.2.patch
+  'overlayscrollbars@2.13.0': patches/overlayscrollbars@2.13.0.patch

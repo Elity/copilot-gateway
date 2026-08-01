@@ -18,9 +18,12 @@ export interface ChatCompletionsPayload {
   parallel_tool_calls?: boolean | null;
   response_format?: Record<string, unknown> | null;
   reasoning_effort?: string | null;
+  // GPT-5-family response-length control. Native OpenAI Chat field.
+  // Reference: https://platform.openai.com/docs/api-reference/chat/create
+  verbosity?: string | null;
   prompt_cache_key?: string | null;
   safety_identifier?: string | null;
-  service_tier?: string | null;
+  service_tier?: 'default' | 'auto' | 'flex' | 'priority' | 'scale' | (string & {}) | null;
   tools?: ChatCompletionsTool[] | null;
   tool_choice?: 'none' | 'auto' | 'required' | { type: 'function'; function: { name: string } } | null;
   /** Request usage stats in streaming responses */
@@ -48,6 +51,7 @@ export interface ChatCompletionsMessage {
   /** Opaque reasoning token/signature for round-tripping */
   reasoning_opaque?: string | null;
   reasoning_items?: ChatCompletionsReasoningItem[] | null;
+  refusal?: string | null;
 }
 
 export interface ChatCompletionsReasoningItem {
@@ -62,7 +66,7 @@ export interface ChatCompletionsToolCall {
   function: { name: string; arguments: string };
 }
 
-export type ChatCompletionsContentPart = ChatCompletionsTextPart | ChatCompletionsImagePart;
+export type ChatCompletionsContentPart = ChatCompletionsTextPart | ChatCompletionsImagePart | ChatCompletionsRefusalPart;
 
 interface ChatCompletionsTextPart {
   type: 'text';
@@ -71,7 +75,17 @@ interface ChatCompletionsTextPart {
 
 interface ChatCompletionsImagePart {
   type: 'image_url';
-  image_url: { url: string; detail?: 'low' | 'high' | 'auto' };
+  // OpenAI publishes `detail` as an optional `[auto, low, high]` string
+  // defaulting to `auto`, with no null member. The value is open here because
+  // the upstream owns the accept decision, and the absent case is the only one
+  // whose meaning the protocol itself fixes.
+  // https://github.com/openai/openai-openapi/blob/db3e53198a66732cfe161339ea63bf36fc0137ad/openapi.yaml#L30795-L30803
+  image_url: { url: string; detail?: 'low' | 'high' | 'auto' | (string & {}) };
+}
+
+interface ChatCompletionsRefusalPart {
+  type: 'refusal';
+  refusal: string;
 }
 
 // Response types
@@ -82,6 +96,9 @@ export interface ChatCompletionsResult {
   created: number;
   model: string;
   choices: ChatCompletionsChoiceNonStreaming[];
+  // https://platform.openai.com/docs/api-reference/chat/object
+  service_tier?: 'default' | 'auto' | 'flex' | 'priority' | 'scale' | (string & {}) | null;
+  system_fingerprint?: string | null;
   usage?: ChatCompletionsUsage;
 }
 
@@ -91,6 +108,8 @@ export interface ChatCompletionsStreamEvent {
   created: number;
   model: string;
   choices: ChatCompletionsChoiceStreaming[];
+  service_tier?: 'default' | 'auto' | 'flex' | 'priority' | 'scale' | (string & {}) | null;
+  system_fingerprint?: string | null;
   usage?: ChatCompletionsUsage;
 }
 
@@ -98,7 +117,7 @@ interface ChatCompletionsUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
-  prompt_tokens_details?: { cached_tokens?: number; cache_creation_input_tokens?: number };
+  prompt_tokens_details?: { cached_tokens?: number; cache_creation_input_tokens?: number; cache_write_tokens?: number };
   completion_tokens_details?: {
     accepted_prediction_tokens: number;
     rejected_prediction_tokens: number;
@@ -115,6 +134,7 @@ export interface ChatCompletionsChoiceNonStreaming {
     reasoning_text?: string | null;
     reasoning_opaque?: string | null;
     reasoning_items?: ChatCompletionsReasoningItem[] | null;
+    refusal?: string | null;
   };
   finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter';
 }
@@ -128,17 +148,26 @@ interface ChatCompletionsChoiceStreaming {
 export interface ChatCompletionsDelta {
   content?: string | null;
   role?: string;
-  tool_calls?: {
-    index: number;
-    id?: string;
-    type?: 'function';
-    function?: { name?: string; arguments?: string };
-  }[];
+  tool_calls?:
+    | {
+      index: number;
+      id?: string;
+      type?: 'function';
+      function?: { name?: string; arguments?: string };
+    }[]
+    | null;
   /** Human-readable reasoning text delta */
   reasoning_text?: string | null;
   /** Opaque reasoning token/signature delta */
   reasoning_opaque?: string | null;
   reasoning_items?: ChatCompletionsReasoningItem[] | null;
+  refusal?: string | null;
 }
 
 export * from './errors.ts';
+
+export { parseChatCompletionsStream, type ParseChatCompletionsStreamOptions } from './stream.ts';
+
+export { CHAT_COMPLETIONS_MISSING_TERMINAL_MESSAGE, collectChatCompletionsProtocolEventsToResult } from './to-result.ts';
+export { reassembleChatCompletionsEvents } from './reassemble.ts';
+export { chatCompletionsProtocolFrameToSSEFrame } from './to-sse.ts';

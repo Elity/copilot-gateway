@@ -2,24 +2,38 @@ import { hasReadableSummary, toResponsesReasoningItem } from '../shared/chat-com
 import { unwrapCustomToolInput } from '../shared/responses-via/custom-tool-wrap.ts';
 import * as responses from '../shared/responses-via/responses-event-builder.ts';
 import type { ChatCompletionsStreamEvent, ChatCompletionsResult } from '@floway-dev/protocols/chat-completions';
-import { eventFrame, type ProtocolFrame } from '@floway-dev/protocols/common';
-import type { ResponsesOutputItem, ResponsesOutputReasoning, ResponsesResult, RawResponsesStreamEvent, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
+import { eventFrame, splitInclusiveInputTokens, type ProtocolFrame } from '@floway-dev/protocols/common';
+import { createRandomResponsesItemId, type ResponsesOutputItem, type ResponsesOutputReasoning, type ResponsesResult, type ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 
-const mapChatCompletionsUsageToResponsesUsage = (usage: ChatCompletionsResult['usage'] | undefined): ResponsesResult['usage'] | undefined =>
-  usage
-    ? {
-        input_tokens: usage.prompt_tokens,
-        output_tokens: usage.completion_tokens,
-        total_tokens: usage.total_tokens,
-        ...(usage.prompt_tokens_details?.cached_tokens !== undefined
-          ? {
-              input_tokens_details: {
-                cached_tokens: usage.prompt_tokens_details.cached_tokens,
-              },
-            }
-          : {}),
-      }
-    : undefined;
+const mapChatCompletionsUsageToResponsesUsage = (usage: ChatCompletionsResult['usage'] | undefined): NonNullable<ResponsesResult['usage']> | undefined => {
+  if (!usage) return undefined;
+  const cachedTokens = usage.prompt_tokens_details?.cached_tokens;
+  const cacheWriteTokens = usage.prompt_tokens_details?.cache_creation_input_tokens
+    ?? usage.prompt_tokens_details?.cache_write_tokens;
+  const reasoningTokens = usage.completion_tokens_details?.reasoning_tokens;
+  splitInclusiveInputTokens(usage.prompt_tokens, cachedTokens, cacheWriteTokens);
+  return {
+    input_tokens: usage.prompt_tokens,
+    output_tokens: usage.completion_tokens,
+    total_tokens: usage.total_tokens,
+    ...(cachedTokens !== undefined || cacheWriteTokens !== undefined
+      ? {
+          input_tokens_details: {
+            cached_tokens: cachedTokens ?? 0,
+            ...(cacheWriteTokens !== undefined ? { cache_write_tokens: cacheWriteTokens } : {}),
+          },
+        }
+      : {}),
+    // Chat Completions' `reasoning_tokens` and Responses' `reasoning_tokens`
+    // are the same quantity, so an upstream that reports one is translated
+    // rather than dropped. OpenAI's schema makes the breakdown mandatory, but
+    // a translator's output is interior — a zero synthesized here would be
+    // indistinguishable from a zero an upstream measured — so absence stays
+    // absence, exactly as for the input breakdown above.
+    // https://github.com/openai/openai-python/blob/f16fbbd2bd25dc1ff150b5f78dbd15ff6bab6d91/src/openai/types/responses/response_usage.py#L21-L47
+    ...(reasoningTokens === undefined ? {} : { output_tokens_details: { reasoning_tokens: reasoningTokens } }),
+  };
+};
 
 const UPSTREAM_CHAT_COMPLETIONS_MISSING_DONE_MESSAGE = 'Upstream Chat Completions stream ended without a DONE sentinel.';
 
@@ -40,6 +54,12 @@ interface PendingTextItem {
   outputIndex: number;
   itemId: string;
   text: string;
+}
+
+interface PendingRefusalItem {
+  outputIndex: number;
+  itemId: string;
+  refusal: string;
 }
 
 interface FunctionCallStreamItem {
@@ -65,7 +85,10 @@ type ChatCompletionsStreamDelta = ChatCompletionsStreamEvent['choices'][0]['delt
 type ChatCompletionsStreamToolCalls = NonNullable<ChatCompletionsStreamDelta['tool_calls']>;
 type ChatCompletionsFinishReason = NonNullable<ChatCompletionsStreamEvent['choices'][0]['finish_reason']>;
 
-type DeferredAfterReasoning = { type: 'content'; content: string } | { type: 'tool_calls'; toolCalls: ChatCompletionsStreamToolCalls };
+type DeferredAfterReasoning =
+  | { type: 'content'; content: string }
+  | { type: 'refusal'; refusal: string }
+  | { type: 'tool_calls'; toolCalls: ChatCompletionsStreamToolCalls };
 
 interface ChatCompletionsToResponsesStreamState {
   responseCreated: boolean;
@@ -77,10 +100,12 @@ interface ChatCompletionsToResponsesStreamState {
   completedItems: (ResponsesOutputItem | undefined)[];
   pendingScalarReasoning?: PendingScalarReasoningItem;
   openText?: PendingTextItem;
+  openRefusal?: PendingRefusalItem;
   openFunctionCalls: Map<number, PendingFunctionCallItem>;
   deferredAfterReasoning: DeferredAfterReasoning[];
   reasoningItemsSeen: boolean;
-  usage?: ResponsesResult['usage'];
+  usage?: NonNullable<ResponsesResult['usage']>;
+  serviceTier?: ResponsesResult['service_tier'];
   pendingFinishReason?: ChatCompletionsFinishReason;
   completed: boolean;
   customToolNames: ReadonlySet<string>;
@@ -115,11 +140,13 @@ const buildResult = (state: ChatCompletionsToResponsesStreamState, status: Respo
     // Chat Completions and don't reach this builder.
     ...(status === 'incomplete' ? { incompleteDetails: { reason: 'max_output_tokens' as const } } : {}),
     ...(state.usage !== undefined ? { usage: state.usage } : {}),
+    ...(state.serviceTier !== undefined ? { serviceTier: state.serviceTier } : {}),
   });
 
 const ensureResponseCreated = (chunk: ChatCompletionsStreamEvent, state: ChatCompletionsToResponsesStreamState): ResponsesStreamEvent[] => {
   state.responseId = chunk.id;
   state.model = chunk.model;
+  if (chunk.service_tier !== undefined) state.serviceTier = chunk.service_tier;
 
   if (chunk.usage) {
     state.usage = mapChatCompletionsUsageToResponsesUsage(chunk.usage);
@@ -145,7 +172,7 @@ const commitPendingScalarReasoning = (state: ChatCompletionsToResponsesStreamSta
   const reasoning = state.pendingScalarReasoning;
   state.pendingScalarReasoning = undefined;
   const outputIndex = state.outputIndex++;
-  const item = responses.reasoningItem(`rs_${outputIndex}`, reasoning.text);
+  const item = responses.reasoningItem(createRandomResponsesItemId('reasoning'), reasoning.text);
 
   return emitCompletedReasoningItem(item, outputIndex, state);
 };
@@ -156,11 +183,27 @@ const closeText = (state: ChatCompletionsToResponsesStreamState): ResponsesStrea
   const textItem = state.openText;
   state.openText = undefined;
 
-  const item = responses.messageItem(textItem.itemId, textItem.text);
+  // Chat Completions has no citation channel, so a translated text part
+  // never carries annotations.
+  const part = responses.textPart(textItem.text, []);
+  const item = responses.messageItem(textItem.itemId, 'completed', part);
 
   state.completedItems[textItem.outputIndex] = item;
 
-  return responses.textDone(state, textItem.outputIndex, textItem.itemId, textItem.text, item);
+  return responses.textDone(state, textItem.outputIndex, textItem.itemId, part, item);
+};
+
+const closeRefusal = (state: ChatCompletionsToResponsesStreamState): ResponsesStreamEvent[] => {
+  if (!state.openRefusal) return [];
+
+  const refusalItem = state.openRefusal;
+  state.openRefusal = undefined;
+
+  const part = responses.refusalPart(refusalItem.refusal);
+  const item = responses.messageItem(refusalItem.itemId, 'completed', part);
+  state.completedItems[refusalItem.outputIndex] = item;
+
+  return responses.refusalDone(state, refusalItem.outputIndex, refusalItem.itemId, part, item);
 };
 
 const closeFunctionCalls = (state: ChatCompletionsToResponsesStreamState): ResponsesStreamEvent[] => {
@@ -199,13 +242,27 @@ const openText = (state: ChatCompletionsToResponsesStreamState): { item: Pending
   if (state.openText) return { item: state.openText, events: [] };
 
   const outputIndex = state.outputIndex++;
-  const itemId = `msg_${outputIndex}`;
+  const itemId = createRandomResponsesItemId('message');
   const item = { outputIndex, itemId, text: '' };
   state.openText = item;
 
   return {
     item,
     events: responses.textStart(state, outputIndex, itemId),
+  };
+};
+
+const openRefusal = (state: ChatCompletionsToResponsesStreamState): { item: PendingRefusalItem; events: ResponsesStreamEvent[] } => {
+  if (state.openRefusal) return { item: state.openRefusal, events: [] };
+
+  const outputIndex = state.outputIndex++;
+  const itemId = createRandomResponsesItemId('message');
+  const item = { outputIndex, itemId, refusal: '' };
+  state.openRefusal = item;
+
+  return {
+    item,
+    events: responses.refusalStart(state, outputIndex, itemId),
   };
 };
 
@@ -218,7 +275,7 @@ const startFunctionCall = (current: PendingFunctionCallItem, state: ChatCompleti
   const outputIndex = state.outputIndex++;
   const streamItem: FunctionCallStreamItem = {
     outputIndex,
-    itemId: isCustom ? `ctc_${outputIndex}` : `fc_${outputIndex}`,
+    itemId: createRandomResponsesItemId(isCustom ? 'custom_tool_call' : 'function_call'),
     kind: isCustom ? 'custom' : 'function',
   };
   current.streamItem = streamItem;
@@ -239,17 +296,30 @@ const startFunctionCall = (current: PendingFunctionCallItem, state: ChatCompleti
 };
 
 const emitContentDelta = (content: string, state: ChatCompletionsToResponsesStreamState): ResponsesStreamEvent[] => {
-  const { item, events } = openText(state);
-  item.text += content;
+  const events = closeRefusal(state);
+  const opened = openText(state);
+  opened.item.text += content;
   state.outputText += content;
-  events.push(...responses.textDelta(state, item.outputIndex, item.itemId, content));
+  events.push(...opened.events, ...responses.textDelta(state, opened.item.outputIndex, opened.item.itemId, content));
 
+  return events;
+};
+
+const emitRefusalDelta = (refusal: string, state: ChatCompletionsToResponsesStreamState): ResponsesStreamEvent[] => {
+  const events = closeText(state);
+  const opened = openRefusal(state);
+  opened.item.refusal += refusal;
+  events.push(...opened.events);
+  if (refusal.length > 0) {
+    events.push(...responses.refusalDelta(state, opened.item.outputIndex, opened.item.itemId, refusal));
+  }
   return events;
 };
 
 const emitToolCallsDelta = (toolCalls: ChatCompletionsStreamToolCalls, state: ChatCompletionsToResponsesStreamState): ResponsesStreamEvent[] => {
   const events: ResponsesStreamEvent[] = [];
   events.push(...closeText(state));
+  events.push(...closeRefusal(state));
 
   for (const toolCall of toolCalls) {
     const current = state.openFunctionCalls.get(toolCall.index) ?? {
@@ -291,7 +361,17 @@ const commitReasoningAndReplayDeferredDeltas = (state: ChatCompletionsToResponse
   state.deferredAfterReasoning = [];
 
   for (const item of deferred) {
-    events.push(...(item.type === 'content' ? emitContentDelta(item.content, state) : emitToolCallsDelta(item.toolCalls, state)));
+    switch (item.type) {
+    case 'content':
+      events.push(...emitContentDelta(item.content, state));
+      break;
+    case 'refusal':
+      events.push(...emitRefusalDelta(item.refusal, state));
+      break;
+    case 'tool_calls':
+      events.push(...emitToolCallsDelta(item.toolCalls, state));
+      break;
+    }
   }
 
   return events;
@@ -300,7 +380,7 @@ const commitReasoningAndReplayDeferredDeltas = (state: ChatCompletionsToResponse
 const finalize = (state: ChatCompletionsToResponsesStreamState): ResponsesStreamEvent[] => {
   if (state.completed || state.pendingFinishReason === undefined) return [];
 
-  const events = [...commitReasoningAndReplayDeferredDeltas(state), ...closeText(state), ...closeFunctionCalls(state)];
+  const events = [...commitReasoningAndReplayDeferredDeltas(state), ...closeText(state), ...closeRefusal(state), ...closeFunctionCalls(state)];
 
   state.completed = true;
   const incomplete = state.pendingFinishReason === 'length';
@@ -332,11 +412,12 @@ export const translateChatCompletionsChunkToResponsesEvents = (chunk: ChatComple
       } else {
         events.push(...commitReasoningAndReplayDeferredDeltas(state));
         events.push(...closeText(state));
+        events.push(...closeRefusal(state));
       }
 
       for (const item of readableReasoningItems) {
         const outputIndex = state.outputIndex++;
-        events.push(...emitCompletedReasoningItem(toResponsesReasoningItem<ResponsesOutputReasoning>(item, `rs_${outputIndex}`), outputIndex, state));
+        events.push(...emitCompletedReasoningItem(toResponsesReasoningItem<ResponsesOutputReasoning>(item), outputIndex, state));
       }
 
       if (hadPendingScalarReasoning) {
@@ -344,7 +425,10 @@ export const translateChatCompletionsChunkToResponsesEvents = (chunk: ChatComple
       }
     } else if (choice.delta.reasoning_text) {
       if (!state.reasoningItemsSeen) {
-        if (!state.pendingScalarReasoning) events.push(...closeText(state));
+        if (!state.pendingScalarReasoning) {
+          events.push(...closeText(state));
+          events.push(...closeRefusal(state));
+        }
         const reasoning = openScalarReasoning(state);
 
         if (choice.delta.reasoning_text) {
@@ -361,6 +445,17 @@ export const translateChatCompletionsChunkToResponsesEvents = (chunk: ChatComple
         });
       } else {
         events.push(...emitContentDelta(choice.delta.content, state));
+      }
+    }
+
+    if (choice.delta.refusal !== undefined && choice.delta.refusal !== null) {
+      if (state.pendingScalarReasoning) {
+        state.deferredAfterReasoning.push({
+          type: 'refusal',
+          refusal: choice.delta.refusal,
+        });
+      } else {
+        events.push(...emitRefusalDelta(choice.delta.refusal, state));
       }
     }
 
@@ -388,7 +483,7 @@ export const flushChatCompletionsToResponsesEvents = (state: ChatCompletionsToRe
 export const translateToSourceEvents = async function* (
   frames: AsyncIterable<ProtocolFrame<ChatCompletionsStreamEvent>>,
   customToolNames: ReadonlySet<string> = new Set(),
-): AsyncGenerator<ProtocolFrame<RawResponsesStreamEvent>> {
+): AsyncGenerator<ProtocolFrame<ResponsesStreamEvent>> {
   const state = createChatCompletionsToResponsesStreamState(customToolNames);
 
   for await (const chunk of upstreamChatCompletionEventsUntilDone(frames)) {

@@ -1,16 +1,25 @@
 import { unwrapCustomToolInput } from '../shared/responses-via/custom-tool-wrap.ts';
 import * as responses from '../shared/responses-via/responses-event-builder.ts';
+import { messagesRefusalResponsesError } from '../shared/via-messages/refusal.ts';
+import { openAIServiceTierFromMessagesUsage } from '../shared/via-messages/service-tier.ts';
+import { inclusiveMessagesInputUsage } from '../shared/via-messages/usage.ts';
 import { eventFrame, type ProtocolFrame } from '@floway-dev/protocols/common';
+import {
+  mergeMessagesUsageSnapshot,
+  messagesUsageSnapshot,
+} from '@floway-dev/protocols/messages';
 import type {
   MessagesContentBlockDeltaEvent,
   MessagesContentBlockStartEvent,
   MessagesContentBlockStopEvent,
   MessagesMessageDeltaEvent,
   MessagesMessageStartEvent,
+  MessagesRefusalStopDetails,
   MessagesStreamEvent,
   MessagesTextCitation,
+  MessagesUsageSnapshot,
 } from '@floway-dev/protocols/messages';
-import type { ResponsesOutputItem, ResponsesResult, RawResponsesStreamEvent, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
+import { createRandomResponsesItemId, type ResponsesAnnotation, type ResponsesOutputItem, type ResponsesResult, type ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 
 const UPSTREAM_MESSAGES_MISSING_TERMINAL_MESSAGE = 'Upstream Messages stream ended without a message_stop event.';
 
@@ -43,12 +52,11 @@ type OutputBlockInfo =
     outputIndex: number;
     itemId: string;
     blockText: string;
-    // Monotonic counter of url_citation annotations for this text
-    // content part. The Responses protocol requires per-content-part
-    // ordering and Responses targets always use content_index=0 for our
-    // single-part assistant message, so one counter per text block
-    // matches the spec.
-    annotationIndex: number;
+    // Citations accumulated in emission order, then carried on the completed
+    // content part. `annotation_index` is scoped to one content part and
+    // Responses targets always use content_index=0 for our single-part
+    // assistant message, so this array's length at push time is that index.
+    annotations: ResponsesAnnotation[];
   }
   | {
     type: 'tool_use';
@@ -56,6 +64,7 @@ type OutputBlockInfo =
     itemId: string;
     toolCallId: string;
     toolName: string;
+    toolNamespace?: string;
     toolArguments: string;
   }
   | {
@@ -75,16 +84,21 @@ interface MessagesToResponsesStreamState {
   blockMap: Map<number, OutputBlockInfo>;
   accumulatedText: string;
   completedItems: ResponsesOutputItem[];
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadInputTokens?: number;
-  cacheCreationInputTokens?: number;
+  usage: MessagesUsageSnapshot;
   stopReason?: MessagesMessageDeltaEvent['delta']['stop_reason'];
+  stopDetails?: MessagesRefusalStopDetails | null;
   customToolNames: ReadonlySet<string>;
+  namespaceTargetToSource: ReadonlyMap<string, { namespace: string; name: string }>;
 }
 
 const buildResult = (state: MessagesToResponsesStreamState, status: ResponsesResult['status']): ResponsesResult => {
-  const inputTokens = state.inputTokens + (state.cacheReadInputTokens ?? 0) + (state.cacheCreationInputTokens ?? 0);
+  const { cacheWrite, cacheWrite1h, inclusiveInput: inputTokens } = inclusiveMessagesInputUsage(state.usage);
+  const cacheCreation = cacheWrite + cacheWrite1h;
+  const hasCacheCreation = state.usage.cache_creation_input_tokens !== undefined
+    || state.usage.cache_creation?.ephemeral_5m_input_tokens !== undefined
+    || state.usage.cache_creation?.ephemeral_1h_input_tokens !== undefined;
+  const thinkingTokens = state.usage.output_tokens_details?.thinking_tokens;
+  const serviceTier = openAIServiceTierFromMessagesUsage(state.usage);
 
   return responses.result({
     id: state.responseId,
@@ -97,14 +111,33 @@ const buildResult = (state: MessagesToResponsesStreamState, status: ResponsesRes
     // `handleMessageStop` in this file). Other Anthropic stop_reasons
     // don't map to incomplete.
     ...(status === 'incomplete' ? { incompleteDetails: { reason: 'max_output_tokens' as const } } : {}),
-    usage: responses.usage(inputTokens, state.outputTokens, state.cacheReadInputTokens),
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: state.usage.output_tokens,
+      total_tokens: inputTokens + state.usage.output_tokens,
+      ...(state.usage.cache_read_input_tokens !== undefined || hasCacheCreation
+        ? {
+            input_tokens_details: {
+              cached_tokens: state.usage.cache_read_input_tokens ?? 0,
+              ...(hasCacheCreation ? { cache_write_tokens: cacheCreation } : {}),
+            },
+          }
+        : {}),
+      // Anthropic's `thinking_tokens` and Responses' `reasoning_tokens` are the
+      // same quantity: the reasoning share of the inclusive output-token total.
+      // As with the input breakdown above, an upstream that reports none is
+      // translated to absence rather than to a synthesized zero.
+      // https://github.com/openai/openai-python/blob/f16fbbd2bd25dc1ff150b5f78dbd15ff6bab6d91/src/openai/types/responses/response_usage.py#L21-L47
+      ...(thinkingTokens === undefined ? {} : { output_tokens_details: { reasoning_tokens: thinkingTokens } }),
+    },
+    ...(serviceTier !== undefined ? { serviceTier } : {}),
+    ...(status === 'failed' ? { error: messagesRefusalResponsesError(state.stopDetails) } : {}),
   });
 };
 
 const handleMessageStart = (event: MessagesMessageStartEvent, state: MessagesToResponsesStreamState): ResponsesStreamEvent[] => {
-  state.inputTokens = event.message.usage.input_tokens;
-  state.cacheReadInputTokens = event.message.usage.cache_read_input_tokens;
-  state.cacheCreationInputTokens = event.message.usage.cache_creation_input_tokens;
+  state.model = event.message.model;
+  state.usage = messagesUsageSnapshot(event.message.usage);
 
   const response = buildResult(state, 'in_progress');
 
@@ -115,7 +148,7 @@ const handleContentBlockStart = (event: MessagesContentBlockStartEvent, state: M
   switch (event.content_block.type) {
   case 'thinking': {
     const outputIndex = state.outputIndex++;
-    const itemId = `rs_${outputIndex}`;
+    const itemId = createRandomResponsesItemId('reasoning');
     state.blockMap.set(event.index, {
       type: 'thinking',
       outputIndex,
@@ -130,7 +163,7 @@ const handleContentBlockStart = (event: MessagesContentBlockStartEvent, state: M
     // `data` and no readable text. Surface it as a Responses reasoning item
     // whose `encrypted_content` round-trips that opaque blob.
     const outputIndex = state.outputIndex++;
-    const itemId = `rs_${outputIndex}`;
+    const itemId = createRandomResponsesItemId('reasoning');
     state.blockMap.set(event.index, {
       type: 'thinking',
       outputIndex,
@@ -143,13 +176,13 @@ const handleContentBlockStart = (event: MessagesContentBlockStartEvent, state: M
   }
   case 'text': {
     const outputIndex = state.outputIndex++;
-    const itemId = `msg_${outputIndex}`;
+    const itemId = createRandomResponsesItemId('message');
     state.blockMap.set(event.index, {
       type: 'text',
       outputIndex,
       itemId,
       blockText: '',
-      annotationIndex: 0,
+      annotations: [],
     });
 
     return responses.textStart(state, outputIndex, itemId);
@@ -157,7 +190,7 @@ const handleContentBlockStart = (event: MessagesContentBlockStartEvent, state: M
   case 'tool_use': {
     const outputIndex = state.outputIndex++;
     if (state.customToolNames.has(event.content_block.name)) {
-      const itemId = `ctc_${outputIndex}`;
+      const itemId = createRandomResponsesItemId('custom_tool_call');
       state.blockMap.set(event.index, {
         type: 'custom_tool_use',
         outputIndex,
@@ -170,19 +203,24 @@ const handleContentBlockStart = (event: MessagesContentBlockStartEvent, state: M
       return responses.itemAdded(state, outputIndex, responses.customToolCallItem(itemId, event.content_block.id, event.content_block.name, ''));
     }
 
-    const itemId = `fc_${outputIndex}`;
+    const itemId = createRandomResponsesItemId('function_call');
+    const sourceTool = state.namespaceTargetToSource.get(event.content_block.name);
     const info: OutputBlockInfo = {
       type: 'tool_use',
       outputIndex,
       itemId,
       toolCallId: event.content_block.id,
-      toolName: event.content_block.name,
+      toolName: sourceTool?.name ?? event.content_block.name,
+      ...(sourceTool !== undefined ? { toolNamespace: sourceTool.namespace } : {}),
       toolArguments: '',
     };
     state.blockMap.set(event.index, info);
 
-    return responses.itemAdded(state, outputIndex, responses.functionCallItem(info.itemId, info.toolCallId, info.toolName, info.toolArguments, 'in_progress'));
+    return responses.itemAdded(state, outputIndex, responses.functionCallItem(info.itemId, info.toolCallId, info.toolName, info.toolArguments, 'in_progress', info.toolNamespace));
   }
+  case 'fallback':
+    state.model = event.content_block.to.model;
+    return [];
   default:
     return [];
   }
@@ -224,7 +262,16 @@ const handleTextCitation = (info: Extract<OutputBlockInfo, { type: 'text' }>, ci
 
   const endIndex = info.blockText.length;
   const startIndex = Math.max(0, endIndex - citation.cited_text.length);
-  const annotationIndex = info.annotationIndex++;
+  const annotationIndex = info.annotations.length;
+  const annotation: ResponsesAnnotation = {
+    type: 'url_citation',
+    url: citation.url,
+    title: citation.title,
+    start_index: startIndex,
+    end_index: endIndex,
+  };
+
+  info.annotations.push(annotation);
 
   return responses.seq(state, [
     {
@@ -233,13 +280,7 @@ const handleTextCitation = (info: Extract<OutputBlockInfo, { type: 'text' }>, ci
       content_index: 0,
       item_id: info.itemId,
       annotation_index: annotationIndex,
-      annotation: {
-        type: 'url_citation',
-        url: citation.url,
-        title: citation.title,
-        start_index: startIndex,
-        end_index: endIndex,
-      },
+      annotation,
     },
   ]);
 };
@@ -300,11 +341,12 @@ const handleContentBlockStop = (event: MessagesContentBlockStopEvent, state: Mes
   }
 
   if (info.type === 'text') {
-    const item = responses.messageItem(info.itemId, info.blockText);
+    const part = responses.textPart(info.blockText, info.annotations);
+    const item = responses.messageItem(info.itemId, 'completed', part);
 
     state.completedItems.push(item);
 
-    return responses.textDone(state, info.outputIndex, info.itemId, info.blockText, item);
+    return responses.textDone(state, info.outputIndex, info.itemId, part, item);
   }
 
   if (info.type === 'custom_tool_use') {
@@ -316,14 +358,19 @@ const handleContentBlockStop = (event: MessagesContentBlockStopEvent, state: Mes
     return responses.customToolCallDone(state, info.outputIndex, info.itemId, input, item);
   }
 
-  const item = responses.functionCallItem(info.itemId, info.toolCallId, info.toolName, info.toolArguments, 'completed');
+  const item = responses.functionCallItem(info.itemId, info.toolCallId, info.toolName, info.toolArguments, 'completed', info.toolNamespace);
 
   state.completedItems.push(item);
 
   return responses.functionCallDone(state, info.outputIndex, info.itemId, info.toolArguments, item);
 };
 
-export const createMessagesToResponsesStreamState = (responseId: string, model: string, customToolNames: ReadonlySet<string> = new Set()): MessagesToResponsesStreamState => ({
+export const createMessagesToResponsesStreamState = (
+  responseId: string,
+  model: string,
+  customToolNames: ReadonlySet<string> = new Set(),
+  namespaceTargetToSource: ReadonlyMap<string, { namespace: string; name: string }> = new Map(),
+): MessagesToResponsesStreamState => ({
   responseId,
   model,
   outputIndex: 0,
@@ -331,9 +378,9 @@ export const createMessagesToResponsesStreamState = (responseId: string, model: 
   blockMap: new Map(),
   accumulatedText: '',
   completedItems: [],
-  inputTokens: 0,
-  outputTokens: 0,
+  usage: messagesUsageSnapshot(),
   customToolNames,
+  namespaceTargetToSource,
 });
 
 export const translateMessagesEventToResponsesEvents = (event: MessagesStreamEvent, state: MessagesToResponsesStreamState): ResponsesStreamEvent[] => {
@@ -350,19 +397,34 @@ export const translateMessagesEventToResponsesEvents = (event: MessagesStreamEve
     if (event.delta.stop_reason !== undefined) {
       state.stopReason = event.delta.stop_reason;
     }
+    if (event.delta.stop_details !== undefined) {
+      state.stopDetails = event.delta.stop_details;
+    }
     if (event.usage) {
-      state.outputTokens = event.usage.output_tokens;
+      state.usage = mergeMessagesUsageSnapshot(state.usage, event.usage);
     }
     return [];
   }
   case 'message_stop': {
-    const status: ResponsesResult['status'] = state.stopReason === 'max_tokens' ? 'incomplete' : 'completed';
+    const status: ResponsesResult['status'] = state.stopReason === 'refusal'
+      ? 'failed'
+      : state.stopReason === 'max_tokens' ? 'incomplete' : 'completed';
     const response = buildResult(state, status);
 
     return responses.terminal(state, response);
   }
+  // Anthropic's `ping` is a transport keep-alive with no Responses counterpart:
+  // every spec event is either a delta event or a state-machine event, and a
+  // `ping` is neither.
+  // https://github.com/openresponses/openresponses/blob/92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c/src/specifications/2026-04-24.mdx#L459
+  // The rule belongs with the producer rather than at a gateway transport
+  // boundary, so that it holds for every consumer of this translation and not
+  // only for the transports the gateway happens to serve; the native path
+  // likewise drops an upstream `ping` inside `parseResponsesStream`. Consuming
+  // the event without emitting one also keeps the sequence numbering
+  // contiguous, which a boundary filter could not do.
   case 'ping':
-    return responses.seq(state, [{ type: 'ping' }]);
+    return [];
   case 'error':
     return responses.seq(state, [
       {
@@ -379,8 +441,9 @@ export const translateToSourceEvents = async function* (
   responseId: string,
   model: string,
   customToolNames: ReadonlySet<string> = new Set(),
-): AsyncGenerator<ProtocolFrame<RawResponsesStreamEvent>> {
-  const state = createMessagesToResponsesStreamState(responseId, model, customToolNames);
+  namespaceTargetToSource: ReadonlyMap<string, { namespace: string; name: string }> = new Map(),
+): AsyncGenerator<ProtocolFrame<ResponsesStreamEvent>> {
+  const state = createMessagesToResponsesStreamState(responseId, model, customToolNames, namespaceTargetToSource);
 
   for await (const event of upstreamMessagesEventsUntilTerminal(frames)) {
     for (const translated of translateMessagesEventToResponsesEvents(event, state)) {

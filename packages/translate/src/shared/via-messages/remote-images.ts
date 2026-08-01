@@ -1,13 +1,12 @@
+import type { RemoteImageLoader } from '../../types.ts';
 import type { MessagesImageBlock } from '@floway-dev/protocols/messages';
 
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
-export interface RemoteImageData {
-  mediaType: string | null;
-  data: Uint8Array;
-}
-
-export type RemoteImageLoader = (url: string) => Promise<RemoteImageData | null>;
+// Pure translation has no runtime egress of its own. Direct callers that omit
+// a loader retain the existing "unavailable remote image is dropped" semantic;
+// gateway call sites inject the platform-backed loader explicitly.
+export const unavailableRemoteImageLoader: RemoteImageLoader = () => Promise.resolve(null);
 
 const parseDataUrl = (url: string): { mediaType: string; data: string } | null => {
   const match = url.match(/^data:([^;]+);base64,(.+)$/);
@@ -76,18 +75,4 @@ export const resolveImageUrlToMessagesImage = async (url: string, loadRemoteImag
 
   if (!url.startsWith('http://') && !url.startsWith('https://')) return null;
   return await resolveRemoteImage(url, loadRemoteImage);
-};
-
-export const fetchRemoteImage = async (url: string): Promise<RemoteImageData | null> => {
-  try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
-    if (!response.ok) return null;
-
-    return {
-      mediaType: response.headers.get('content-type'),
-      data: new Uint8Array(await response.arrayBuffer()),
-    };
-  } catch {
-    return null;
-  }
 };

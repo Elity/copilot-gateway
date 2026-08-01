@@ -25,8 +25,6 @@ export type GeminiSupportedImageMimeType = (typeof GEMINI_SUPPORTED_IMAGE_MIME_T
 
 export const geminiToolCallId = (turnIndex: number, partIndex: number): string => `gemini_call_${turnIndex}_${partIndex}`;
 
-export const geminiReasoningId = (turnIndex: number, partIndex: number): string => `gemini_reasoning_${turnIndex}_${partIndex}`;
-
 export type GeminiPartKind = 'text' | 'inline_data' | 'function_call' | 'function_response' | 'file_data' | 'executable_code' | 'code_execution_result';
 
 type GeminiPartDataField = keyof Omit<GeminiPart, 'thought' | 'thoughtSignature'>;
@@ -117,21 +115,31 @@ export const geminiFunctionResponsePart = (part: GeminiPart, ids: GeminiToolCall
   return { response, id: unmatched?.shift() ?? id };
 };
 
-export const geminiThinkingLevelEffort = (thinkingConfig?: GeminiThinkingConfig): 'low' | 'medium' | 'high' | undefined => {
-  switch (thinkingConfig?.thinkingLevel) {
-  case 'minimal':
-  case 'low':
-    return 'low';
-  case 'medium':
-    return 'medium';
-  case 'high':
-    return 'high';
-  default:
-    return undefined;
-  }
-};
+// Reasoning effort is freeform on the inbound IRs — the gateway never
+// enum-gates these values at the wire boundary — so the translate-side
+// mappers below return whatever Gemini surfaced for `thinkingLevel` /
+// derived from `thinkingBudget` verbatim.
 
-export const geminiReasoningEffort = (thinkingConfig?: GeminiThinkingConfig): 'none' | 'low' | 'medium' | 'high' | null => {
+export const geminiThinkingLevelEffort = (thinkingConfig?: GeminiThinkingConfig): string | undefined =>
+  thinkingConfig?.thinkingLevel;
+
+// Bucket Gemini's numeric `thinkingBudget` back onto the discrete
+// `reasoning_effort` axis when the target protocol has no numeric budget
+// slot (Chat Completions, Responses). Google publishes per-model
+// budget ranges but not effort-name thresholds; the 2048 / 8192 bin
+// edges below invert the community convention of using those same
+// numbers as the DEFAULT budget per effort tier — treating "medium's
+// default is 2048" as "budgets up to and including 2048 read as low
+// tier", and "high's default is 8192" as "budgets up to 8192 read as
+// medium tier".
+//
+// References:
+// - Google Gemini thinking config: https://ai.google.dev/gemini-api/docs/thinking
+// - AutoReview (community): `THINK_BUDGETS = { low: 512, medium: 2048, high: 8192 }`
+//   https://github.com/krzysztofdudek/AutoReview/blob/9bf2ede3a960f5215645bedba41c591829053f5c/scripts/lib/providers/google.mjs#L4
+// - LiteLLM (community): `DEFAULT_REASONING_EFFORT_MEDIUM_THINKING_BUDGET = 2048`
+//   https://github.com/BerriAI/litellm/blob/88e03e548716a45284597edf2b7f47a7e6a66d5f/litellm/constants.py#L184
+export const geminiReasoningEffort = (thinkingConfig?: GeminiThinkingConfig): string | null => {
   if (!thinkingConfig) return null;
 
   if (thinkingConfig.thinkingBudget !== undefined) {
@@ -175,8 +183,8 @@ export interface GeminiThoughtSignatureState {
   pendingThoughtSignature?: string;
 }
 
-export const appendGeminiThoughtSignature = (state: GeminiThoughtSignatureState, signature: string): void => {
-  state.pendingThoughtSignature = `${state.pendingThoughtSignature ?? ''}${signature}`;
+export const setGeminiThoughtSignature = (state: GeminiThoughtSignatureState, signature: string): void => {
+  state.pendingThoughtSignature = signature;
 };
 
 export const signGeminiPart = (state: GeminiThoughtSignatureState, part: GeminiPart): GeminiPart => {
@@ -213,12 +221,13 @@ export const parseStrictJsonObject = (json: string, subject: string): Record<str
 
 // Shape a single-candidate Gemini stream event. Lives in shared because both
 // gemini-via-messages and gemini-via-responses produce the same envelope.
-export const geminiCandidateEvent = (parts: GeminiPart[], finishReason?: GeminiFinishReason, usageMetadata?: GeminiUsageMetadata): GeminiStreamEvent => ({
+export const geminiCandidateEvent = (parts: GeminiPart[], finishReason?: GeminiFinishReason, usageMetadata?: GeminiUsageMetadata, finishMessage?: string): GeminiStreamEvent => ({
   candidates: [
     {
       index: 0,
       content: { role: 'model', parts },
       ...(finishReason !== undefined ? { finishReason } : {}),
+      ...(finishMessage !== undefined ? { finishMessage } : {}),
     },
   ],
   ...(usageMetadata !== undefined ? { usageMetadata } : {}),

@@ -1,0 +1,60 @@
+{
+  "name": "@floway-dev/gateway",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    },
+    "./app-type": {
+      "types": "./src/app.ts"
+    },
+    "./control-plane/proxies/serialize": {
+      "types": "./src/control-plane/proxies/serialize.ts"
+    },
+    "./control-plane/performance/aggregate": {
+      "types": "./src/control-plane/performance/aggregate.ts"
+    },
+    "./dump-codec": {
+      "import": "./src/dump/codec.ts",
+      "types": "./src/dump/codec.ts"
+    },
+    "./dump-types": {
+      "types": "./src/dump/types.ts"
+    },
+    "./migrations-dir": {
+      "import": "./src/migrations-dir.ts",
+      "types": "./src/migrations-dir.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@floway-dev/agent-setup": "workspace:*",
+    "@floway-dev/http": "workspace:*",
+    "@floway-dev/interceptor": "workspace:*",
+    "@floway-dev/platform": "workspace:*",
+    "@floway-dev/protocols": "workspace:*",
+    "@floway-dev/provider": "workspace:*",
+    "@floway-dev/provider-azure": "workspace:*",
+    "@floway-dev/provider-claude-code": "workspace:*",
+    "@floway-dev/provider-codex": "workspace:*",
+    "@floway-dev/provider-copilot": "workspace:*",
+    "@floway-dev/provider-custom": "workspace:*",
+    "@floway-dev/provider-ollama": "workspace:*",
+    "@floway-dev/proxy": "workspace:*",
+    "@floway-dev/translate": "workspace:*",
+    "@hono/zod-validator": "^0.8.0",
+    "es-toolkit": "^1.49.0",
+    "hono": "^4",
+    "jsonrepair": "^3.14.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@floway-dev/test-utils": "workspace:*",
+    "sql.js": "^1.14.1"
+  }
+}

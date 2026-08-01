@@ -1,7 +1,8 @@
 import { chatCompletionsContentToResponsesInputContent, chatCompletionsContentToText } from '../shared/chat-completions-and-responses/content.ts';
 import { scalarToResponsesReasoningItem, translateChatCompletionsReasoningItems } from '../shared/chat-completions-and-responses/reasoning.ts';
-import type { ChatCompletionsPayload, ChatCompletionsTool } from '@floway-dev/protocols/chat-completions';
-import type { ResponsesInputItem, ResponsesInputReasoning, ResponsesPayload, ResponsesTool, ResponsesToolChoice } from '@floway-dev/protocols/responses';
+import { TranslatorInputError } from '../translator-input-error.ts';
+import type { ChatCompletionsMessage, ChatCompletionsPayload, ChatCompletionsTool } from '@floway-dev/protocols/chat-completions';
+import type { CanonicalResponsesPayload, ResponsesInputContent, ResponsesInputItem, ResponsesInputReasoning, ResponsesTool, ResponsesToolChoice } from '@floway-dev/protocols/responses';
 
 const translateChatTools = (tools?: ChatCompletionsTool[] | null): ResponsesTool[] | null =>
   tools?.length
@@ -16,10 +17,33 @@ const translateChatTools = (tools?: ChatCompletionsTool[] | null): ResponsesTool
       }))
     : null;
 
-const translateChatToolChoice = (choice?: ChatCompletionsPayload['tool_choice']): ResponsesToolChoice =>
-  choice == null ? 'auto' : typeof choice === 'string' ? choice : { type: 'function', name: choice.function.name };
+const translateChatToolChoice = (choice: NonNullable<ChatCompletionsPayload['tool_choice']>): ResponsesToolChoice =>
+  typeof choice === 'string' ? choice : { type: 'function', name: choice.function.name };
 
-export const translateChatCompletionsToResponses = (payload: ChatCompletionsPayload): ResponsesPayload => {
+const translateAssistantContent = (message: ChatCompletionsMessage): ResponsesInputContent[] => {
+  const content: ResponsesInputContent[] = [];
+  let hasRefusalPart = false;
+
+  if (typeof message.content === 'string') {
+    if (message.content) content.push({ type: 'output_text', text: message.content });
+  } else if (Array.isArray(message.content)) {
+    for (const part of message.content) {
+      if (part.type === 'text') content.push({ type: 'output_text', text: part.text });
+      else if (part.type === 'refusal') {
+        content.push({ type: 'refusal', refusal: part.refusal });
+        hasRefusalPart = true;
+      }
+    }
+  }
+
+  if (message.refusal !== undefined && message.refusal !== null && !hasRefusalPart) {
+    content.push({ type: 'refusal', refusal: message.refusal });
+  }
+
+  return content;
+};
+
+export const buildTargetRequest = (payload: ChatCompletionsPayload): CanonicalResponsesPayload => {
   const instructions: string[] = [];
   const input: ResponsesInputItem[] = [];
   let hoistSystemPrefix = true;
@@ -46,8 +70,9 @@ export const translateChatCompletionsToResponses = (payload: ChatCompletionsPayl
     }
 
     if (message.role === 'assistant') {
-      const reasoningItems = translateChatCompletionsReasoningItems<ResponsesInputReasoning>(message.reasoning_items, () => input.length);
-      const scalarReasoning = scalarToResponsesReasoningItem<ResponsesInputReasoning>(message.reasoning_text, `rs_${input.length}`);
+      const assistantContent = translateAssistantContent(message);
+      const reasoningItems = translateChatCompletionsReasoningItems<ResponsesInputReasoning>(message.reasoning_items);
+      const scalarReasoning = scalarToResponsesReasoningItem<ResponsesInputReasoning>(message.reasoning_text);
       if (reasoningItems) {
         input.push(...reasoningItems);
       } else if (scalarReasoning) {
@@ -55,12 +80,11 @@ export const translateChatCompletionsToResponses = (payload: ChatCompletionsPayl
       }
 
       if (message.tool_calls?.length) {
-        const text = chatCompletionsContentToText(message.content);
-        if (text) {
+        if (assistantContent.length > 0) {
           input.push({
             type: 'message',
             role: 'assistant',
-            content: [{ type: 'output_text', text }],
+            content: assistantContent,
           });
         }
 
@@ -77,11 +101,10 @@ export const translateChatCompletionsToResponses = (payload: ChatCompletionsPayl
         continue;
       }
 
-      const text = chatCompletionsContentToText(message.content);
       input.push({
         type: 'message',
         role: 'assistant',
-        content: text ? [{ type: 'output_text', text }] : '',
+        content: assistantContent.length > 0 ? assistantContent : '',
       });
       continue;
     }
@@ -96,11 +119,11 @@ export const translateChatCompletionsToResponses = (payload: ChatCompletionsPayl
     }
 
     if (message.role !== 'tool') {
-      throw new Error(`Chat Completions → Responses translator does not accept ${(message as { role: string }).role} messages.`);
+      throw new TranslatorInputError(`Invalid role '${(message as { role: string }).role}'.`);
     }
 
     if (!message.tool_call_id) {
-      throw new Error('tool message requires tool_call_id for Responses translation');
+      throw new TranslatorInputError("Missing required field 'tool_call_id' on a 'tool' role message.");
     }
 
     input.push({
@@ -112,6 +135,12 @@ export const translateChatCompletionsToResponses = (payload: ChatCompletionsPayl
 
   const responseTextConfig = payload.response_format === undefined ? undefined : payload.response_format === null ? null : { format: payload.response_format };
 
+  // Chat's `reasoning_effort: 'none'` disables reasoning without a Responses
+  // equivalent (Responses `reasoning.effort` has no 'none' member); drop the
+  // field instead of forwarding a value the upstream rejects.
+  const reasoningEffort = payload.reasoning_effort && payload.reasoning_effort !== 'none' ? payload.reasoning_effort : undefined;
+  const reasoning = reasoningEffort !== undefined ? { effort: reasoningEffort } : undefined;
+
   return {
     model: payload.model,
     input,
@@ -120,7 +149,14 @@ export const translateChatCompletionsToResponses = (payload: ChatCompletionsPayl
     ...(payload.top_p !== undefined ? { top_p: payload.top_p } : {}),
     ...(payload.max_tokens !== undefined ? { max_output_tokens: payload.max_tokens } : {}),
     ...(payload.tools !== undefined ? { tools: translateChatTools(payload.tools) } : {}),
-    tool_choice: translateChatToolChoice(payload.tool_choice),
+    // Responses upstreams disagree on an orphaned `tool_choice` — one sent
+    // without tools: OpenAI-backed models ignore it, while xAI-backed ones
+    // reject the request with `invalid-argument: A tool_choice was set on the
+    // request but no tools were specified`. Other gateways hit the same wall on
+    // both the native Responses path and the Responses → Chat Completions path:
+    // https://github.com/Wei-Shaw/sub2api/issues/4819
+    // https://github.com/jlcodes99/cockpit-tools/issues/1727
+    ...(payload.tool_choice != null && payload.tools?.length ? { tool_choice: translateChatToolChoice(payload.tool_choice) } : {}),
     // Same-purpose OpenAI fields are normal Chat/Responses adapter surface;
     // provider-specific policy filtering belongs at the target boundary, not in
     // pairwise translation.
@@ -134,12 +170,10 @@ export const translateChatCompletionsToResponses = (payload: ChatCompletionsPayl
     // https://developers.openai.com/api/docs/guides/migrate-to-responses
     ...(payload.store !== undefined ? { store: payload.store } : {}),
     ...(payload.parallel_tool_calls !== undefined ? { parallel_tool_calls: payload.parallel_tool_calls } : {}),
-    ...(payload.reasoning_effort != null ? { reasoning: { effort: payload.reasoning_effort } } : {}),
+    ...(reasoning ? { reasoning } : {}),
     ...(responseTextConfig !== undefined ? { text: responseTextConfig } : {}),
     ...(payload.prompt_cache_key !== undefined ? { prompt_cache_key: payload.prompt_cache_key } : {}),
     ...(payload.safety_identifier !== undefined ? { safety_identifier: payload.safety_identifier } : {}),
     ...(payload.service_tier !== undefined ? { service_tier: payload.service_tier } : {}),
   };
 };
-
-export const buildTargetRequest = translateChatCompletionsToResponses;

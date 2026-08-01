@@ -1,12 +1,14 @@
 import { translateToSourceEvents } from './events.ts';
 import { buildTargetRequest } from './request.ts';
+import { rewriteContextExceededToPromptTooLong } from '../shared/messages-via/context-window-error.ts';
 import type { TranslateTrip } from '../types.ts';
 import type { MessagesPayload, MessagesStreamEvent } from '@floway-dev/protocols/messages';
-import type { ResponsesPayload, RawResponsesStreamEvent } from '@floway-dev/protocols/responses';
+import type { CanonicalResponsesPayload, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 
 export const translateMessagesViaResponses: TranslateTrip<
-  MessagesPayload, MessagesStreamEvent, ResponsesPayload, RawResponsesStreamEvent
+  MessagesPayload, MessagesStreamEvent, CanonicalResponsesPayload, ResponsesStreamEvent
 > = async src => ({
   target: buildTargetRequest(src),
   events: translateToSourceEvents,
+  apiError: rewriteContextExceededToPromptTooLong,
 });

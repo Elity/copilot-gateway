@@ -1,5 +1,5 @@
 import type { ChatCompletionsStreamEvent } from '@floway-dev/protocols/chat-completions';
-import { eventFrame, type ProtocolFrame } from '@floway-dev/protocols/common';
+import { eventFrame, splitCacheWriteTokens, splitInclusiveInputTokens, type ProtocolFrame } from '@floway-dev/protocols/common';
 import type { MessagesContentBlockDeltaEvent, MessagesContentBlockStartEvent, MessagesResult, MessagesStreamEvent } from '@floway-dev/protocols/messages';
 
 const toMessagesId = (id: string): string => (id.startsWith('msg_') ? id : `msg_${id.replace(/^chatcmpl-/, '')}`);
@@ -19,11 +19,7 @@ const mapChatCompletionsFinishReasonToMessagesStopReason = (finishReason: 'stop'
   }
 };
 
-interface ChatCompletionsUsage {
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  prompt_tokens_details?: { cached_tokens?: number; cache_creation_input_tokens?: number };
-}
+type ChatCompletionsUsage = NonNullable<ChatCompletionsStreamEvent['usage']>;
 
 // OpenAI-shaped upstreams piggyback Anthropic-style cache buckets on
 // `prompt_tokens_details`. `prompt_tokens` already includes both
@@ -37,17 +33,32 @@ interface ChatCompletionsUsage {
 // https://github.com/caozhiyuan/copilot-api/commit/a99c23551b0f3198d78dd51142dd0096cc6da049
 export const mapChatCompletionsUsageToMessagesUsage = (usage?: ChatCompletionsUsage): MessagesResult['usage'] => {
   const cachedTokens = usage?.prompt_tokens_details?.cached_tokens;
-  const cacheCreationTokens = usage?.prompt_tokens_details?.cache_creation_input_tokens;
+  const cacheCreationTokens = usage?.prompt_tokens_details?.cache_creation_input_tokens
+    ?? usage?.prompt_tokens_details?.cache_write_tokens;
+  const writes = splitCacheWriteTokens(cacheCreationTokens, 0);
+  const { input, cacheRead, cacheWrite } = splitInclusiveInputTokens(
+    usage?.prompt_tokens ?? 0,
+    cachedTokens,
+    cacheCreationTokens,
+  );
 
   return {
     // `cached_tokens` and `cache_creation_input_tokens` are disjoint subsets of
     // `prompt_tokens`, so the subtraction cannot go negative under any
     // standards-conforming upstream. Do NOT clamp with Math.max(0, ...) — that
     // would mask a real upstream contract violation rather than fix anything.
-    input_tokens: (usage?.prompt_tokens ?? 0) - (cachedTokens ?? 0) - (cacheCreationTokens ?? 0),
+    input_tokens: input,
     output_tokens: usage?.completion_tokens ?? 0,
-    ...(cachedTokens !== undefined ? { cache_read_input_tokens: cachedTokens } : {}),
-    ...(cacheCreationTokens !== undefined ? { cache_creation_input_tokens: cacheCreationTokens } : {}),
+    ...(cachedTokens !== undefined ? { cache_read_input_tokens: cacheRead } : {}),
+    ...(cacheCreationTokens !== undefined ? { cache_creation_input_tokens: cacheWrite } : {}),
+    ...(writes.cacheWrite1h > 0
+      ? {
+          cache_creation: {
+            ephemeral_5m_input_tokens: writes.cacheWrite,
+            ephemeral_1h_input_tokens: writes.cacheWrite1h,
+          },
+        }
+      : {}),
   };
 };
 
@@ -98,7 +109,11 @@ interface ChatCompletionsToMessagesStreamState {
   // https://github.com/caozhiyuan/copilot-api/blob/main/src/routes/messages/stream-translation.ts#L240
   deferredContent?: string;
   pendingFinishReason?: ChatCompletionsStreamEvent['choices'][0]['finish_reason'];
+  refusalText: string;
+  sawRefusal: boolean;
   pendingUsage?: ChatCompletionsStreamEvent['usage'];
+  // Captured from any chunk's service_tier for speed pass-through.
+  upstreamServiceTier?: string;
   finalMessageSent?: boolean;
 }
 
@@ -130,7 +145,7 @@ const attachOpaqueToOpenThinkingBlock = (state: ChatCompletionsToMessagesStreamS
     return false;
   }
 
-  state.pendingThinkingSignature = (state.pendingThinkingSignature ?? '') + state.pendingReasoningOpaque;
+  state.pendingThinkingSignature = state.pendingReasoningOpaque;
   state.pendingReasoningOpaque = undefined;
   return true;
 };
@@ -219,12 +234,12 @@ const handleReasoningDelta = (delta: ChatCompletionsStreamDelta, state: ChatComp
   }
 
   if (state.openBlock === 'thinking') {
-    state.pendingThinkingSignature = (state.pendingThinkingSignature ?? '') + delta.reasoning_opaque;
+    state.pendingThinkingSignature = delta.reasoning_opaque;
     emitPendingReasoningAndDeferred(state, events);
     return;
   }
 
-  state.pendingReasoningOpaque = (state.pendingReasoningOpaque ?? '') + delta.reasoning_opaque;
+  state.pendingReasoningOpaque = delta.reasoning_opaque;
 };
 
 const emitToolCallsDelta = (toolCalls: ChatCompletionsStreamToolCalls, state: ChatCompletionsToMessagesStreamState, events: MessagesStreamEvent[]): void => {
@@ -316,11 +331,25 @@ const emitFinalMessageIfReady = (state: ChatCompletionsToMessagesStreamState, ev
 
   const usage = mapChatCompletionsUsageToMessagesUsage(state.pendingUsage);
 
+  if (state.upstreamServiceTier === 'fast') usage.speed = 'fast';
+  else if (state.upstreamServiceTier !== undefined) usage.service_tier = state.upstreamServiceTier;
+
+  const refused = state.sawRefusal || state.pendingFinishReason === 'content_filter';
+
   events.push(
     {
       type: 'message_delta',
       delta: {
-        stop_reason: mapChatCompletionsFinishReasonToMessagesStopReason(state.pendingFinishReason),
+        stop_reason: refused ? 'refusal' : mapChatCompletionsFinishReasonToMessagesStopReason(state.pendingFinishReason),
+        ...(refused
+          ? {
+              stop_details: {
+                type: 'refusal' as const,
+                category: null,
+                explanation: state.refusalText || null,
+              },
+            }
+          : {}),
         stop_sequence: null,
       },
       usage,
@@ -337,10 +366,14 @@ export const createChatCompletionsToMessagesStreamState = (): ChatCompletionsToM
   contentBlockIndex: 0,
   toolCalls: {},
   deferredAfterThinking: [],
+  refusalText: '',
+  sawRefusal: false,
 });
 
 export const translateChatCompletionsChunkToMessagesEvents = (chunk: ChatCompletionsStreamEvent, state: ChatCompletionsToMessagesStreamState): MessagesStreamEvent[] => {
   const events: MessagesStreamEvent[] = [];
+
+  if (chunk.service_tier != null) state.upstreamServiceTier = chunk.service_tier;
 
   if (chunk.choices.length === 0) {
     if (chunk.usage) {
@@ -376,6 +409,10 @@ export const translateChatCompletionsChunkToMessagesEvents = (chunk: ChatComplet
   handleReasoningDelta(choice.delta, state, events);
 
   const content = choice.delta.content;
+  if (choice.delta.refusal !== undefined && choice.delta.refusal !== null) {
+    state.sawRefusal = true;
+    state.refusalText += choice.delta.refusal;
+  }
   const toolCalls = choice.delta.tool_calls;
   const hasToolCallDelta = Boolean(toolCalls?.length);
 

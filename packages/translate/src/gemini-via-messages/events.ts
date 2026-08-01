@@ -1,7 +1,9 @@
-import { appendGeminiThoughtSignature, flushGeminiThoughtSignature, type GeminiThoughtSignatureState, geminiCandidateEvent, parseStrictJsonObject, signGeminiPart } from '../shared/gemini-via/gemini.ts';
-import { eventFrame, type ProtocolFrame } from '@floway-dev/protocols/common';
+import { flushGeminiThoughtSignature, type GeminiThoughtSignatureState, geminiCandidateEvent, parseStrictJsonObject, setGeminiThoughtSignature, signGeminiPart } from '../shared/gemini-via/gemini.ts';
+import { messagesRefusalExplanation } from '../shared/via-messages/refusal.ts';
+import { inclusiveMessagesInputUsage } from '../shared/via-messages/usage.ts';
+import { billableServiceTier, eventFrame, splitInclusiveInputTokens, type ProtocolFrame } from '@floway-dev/protocols/common';
 import type { GeminiFinishReason, GeminiStreamEvent, GeminiUsageMetadata } from '@floway-dev/protocols/gemini';
-import type { MessagesStreamEvent } from '@floway-dev/protocols/messages';
+import { mergeMessagesUsageSnapshot, messagesUsageSnapshot, type MessagesStreamEvent, type MessagesUsageSnapshot } from '@floway-dev/protocols/messages';
 
 const messagesStopReasonToGemini = (stopReason: Extract<MessagesStreamEvent, { type: 'message_delta' }>['delta']['stop_reason']): GeminiFinishReason => {
   switch (stopReason) {
@@ -41,27 +43,28 @@ interface MessagesToolUseDraft {
 }
 
 interface MessagesToGeminiStreamState extends GeminiThoughtSignatureState {
-  inputTokens: number;
-  cacheReadInputTokens: number;
-  cacheCreationInputTokens: number;
+  usage: MessagesUsageSnapshot;
   toolUses: Record<number, MessagesToolUseDraft>;
 }
 
-// Anthropic's input_tokens excludes cache reads and cache creation; Gemini's
-// promptTokenCount is an inclusive total like OpenAI's prompt_tokens. Fold all
-// three Anthropic buckets into the Gemini total, then surface cache reads
-// separately as cachedContentTokenCount.
-const mapUsage = (state: MessagesToGeminiStreamState, usage?: Extract<MessagesStreamEvent, { type: 'message_delta' }>['usage']): GeminiUsageMetadata | undefined => {
-  if (!usage) return undefined;
-
-  const promptTokenCount = state.inputTokens + state.cacheReadInputTokens + state.cacheCreationInputTokens;
-  const candidatesTokenCount = usage.output_tokens;
+// Gemini's `promptTokenCount` is an inclusive total that already contains the
+// cached prefix, and `cachedContentTokenCount` is the breakdown of that share
+// rather than an extra bucket — so the folded Anthropic total goes out whole
+// and cache reads are re-surfaced alongside it, not subtracted from it.
+// https://github.com/googleapis/js-genai/blob/86d4bfa5b8d026b6d9fae46f0069e7b7972beb80/src/types.ts#L7594-L7597
+const mapUsage = (state: MessagesToGeminiStreamState, hasTerminalUsage: boolean): GeminiUsageMetadata | undefined => {
+  const { cacheRead, cacheWrite, cacheWrite1h, inclusiveInput: promptTokenCount } = inclusiveMessagesInputUsage(state.usage);
+  const cacheWriteTotal = cacheWrite + cacheWrite1h;
+  const candidatesTokenCount = state.usage.output_tokens;
+  splitInclusiveInputTokens(promptTokenCount, cacheRead, cacheWriteTotal);
+  const serviceTier = billableServiceTier(state.usage.speed) ?? billableServiceTier(state.usage.service_tier);
+  if (!hasTerminalUsage && promptTokenCount === 0 && serviceTier === null) return undefined;
 
   return {
     promptTokenCount,
     candidatesTokenCount,
     totalTokenCount: promptTokenCount + candidatesTokenCount,
-    ...(state.cacheReadInputTokens > 0 ? { cachedContentTokenCount: state.cacheReadInputTokens } : {}),
+    ...(cacheRead > 0 ? { cachedContentTokenCount: cacheRead } : {}),
   };
 };
 
@@ -73,9 +76,7 @@ const throwOnMessagesFatalEvent = (event: MessagesStreamEvent): void => {
 
 export const translateToSourceEvents = async function* (frames: AsyncIterable<ProtocolFrame<MessagesStreamEvent>>): AsyncGenerator<ProtocolFrame<GeminiStreamEvent>> {
   const state: MessagesToGeminiStreamState = {
-    inputTokens: 0,
-    cacheReadInputTokens: 0,
-    cacheCreationInputTokens: 0,
+    usage: messagesUsageSnapshot(),
     toolUses: {},
   };
 
@@ -84,9 +85,7 @@ export const translateToSourceEvents = async function* (frames: AsyncIterable<Pr
 
     switch (event.type) {
     case 'message_start':
-      state.inputTokens = event.message.usage.input_tokens;
-      state.cacheReadInputTokens = event.message.usage.cache_read_input_tokens ?? 0;
-      state.cacheCreationInputTokens = event.message.usage.cache_creation_input_tokens ?? 0;
+      state.usage = messagesUsageSnapshot(event.message.usage);
       break;
 
     case 'content_block_start':
@@ -101,7 +100,7 @@ export const translateToSourceEvents = async function* (frames: AsyncIterable<Pr
       }
 
       if (event.content_block.type === 'redacted_thinking') {
-        appendGeminiThoughtSignature(state, event.content_block.data);
+        setGeminiThoughtSignature(state, event.content_block.data);
         break;
       }
 
@@ -130,7 +129,7 @@ export const translateToSourceEvents = async function* (frames: AsyncIterable<Pr
         }
         break;
       case 'signature_delta':
-        appendGeminiThoughtSignature(state, event.delta.signature);
+        setGeminiThoughtSignature(state, event.delta.signature);
         break;
       case 'text_delta':
         if (event.delta.text.length > 0) {
@@ -171,7 +170,13 @@ export const translateToSourceEvents = async function* (frames: AsyncIterable<Pr
     }
 
     case 'message_delta': {
-      yield eventFrame(geminiCandidateEvent(flushGeminiThoughtSignature(state), messagesStopReasonToGemini(event.delta.stop_reason), mapUsage(state, event.usage)));
+      if (event.usage) state.usage = mergeMessagesUsageSnapshot(state.usage, event.usage);
+      yield eventFrame(geminiCandidateEvent(
+        flushGeminiThoughtSignature(state),
+        messagesStopReasonToGemini(event.delta.stop_reason),
+        mapUsage(state, event.usage !== undefined),
+        event.delta.stop_reason === 'refusal' ? messagesRefusalExplanation(event.delta.stop_details) : undefined,
+      ));
       break;
     }
 

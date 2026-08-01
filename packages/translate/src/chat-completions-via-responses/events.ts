@@ -1,9 +1,9 @@
-import { toChatCompletionsReasoningItem } from '../shared/chat-completions-and-responses/reasoning.ts';
+import { hasReadableSummary, toChatCompletionsReasoningItem } from '../shared/chat-completions-and-responses/reasoning.ts';
 import { createResponsesOutputOrderState, recordResponsesOutputOrderEvent, type ResponsesOutputOrderState, shouldDeferForEarlierResponsesOutput } from '../shared/via-responses/responses-stream-order.ts';
-import { type ResponsesEvent, responsesPartKey } from '../shared/via-responses/responses-stream.ts';
+import { responsesPartKey } from '../shared/via-responses/responses-stream.ts';
 import type { ChatCompletionsStreamEvent, ChatCompletionsResult, ChatCompletionsReasoningItem, ChatCompletionsDelta } from '@floway-dev/protocols/chat-completions';
-import { doneFrame, eventFrame, type ProtocolFrame } from '@floway-dev/protocols/common';
-import type { ResponsesOutputItem, ResponsesResult, RawResponsesStreamEvent, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
+import { doneFrame, eventFrame, splitInclusiveInputTokens, type ProtocolFrame } from '@floway-dev/protocols/common';
+import { isResponsesTerminalEvent, type ResponsesOutputItem, type ResponsesResult, type ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 
 const mapResponsesFinishReasonToChatCompletionsFinishReason = (response: ResponsesResult): ChatCompletionsResult['choices'][0]['finish_reason'] =>
   response.status === 'incomplete' && response.incomplete_details?.reason === 'max_output_tokens'
@@ -14,12 +14,12 @@ const mapResponsesFinishReasonToChatCompletionsFinishReason = (response: Respons
 
 const UPSTREAM_RESPONSES_MISSING_TERMINAL_MESSAGE = 'Upstream Responses stream ended without a terminal event.';
 
-const upstreamResponsesEventsUntilTerminal = async function* (frames: AsyncIterable<ProtocolFrame<RawResponsesStreamEvent>>): AsyncGenerator<RawResponsesStreamEvent> {
+const upstreamResponsesEventsUntilTerminal = async function* (frames: AsyncIterable<ProtocolFrame<ResponsesStreamEvent>>): AsyncGenerator<ResponsesStreamEvent> {
   for await (const frame of frames) {
     if (frame.type === 'done') continue;
 
     yield frame.event;
-    if (frame.event.type === 'response.completed' || frame.event.type === 'response.incomplete' || frame.event.type === 'response.failed' || frame.event.type === 'error') {
+    if (isResponsesTerminalEvent(frame.event)) {
       return;
     }
   }
@@ -47,6 +47,7 @@ interface ResponsesToChatCompletionsStreamState {
   emittedTextContentKeys: Set<string>;
   emittedFunctionArgumentOutputIndexes: Set<number>;
   outputOrder: ResponsesOutputOrderState;
+  serviceTier?: ChatCompletionsStreamEvent['service_tier'];
   done: boolean;
 }
 
@@ -67,8 +68,6 @@ export const createResponsesToChatCompletionsStreamState = (): ResponsesToChatCo
 
 const trackReasoningOutputItem = (item: ResponsesOutputItem): boolean => item.type === 'reasoning';
 
-const hasReadableSummary = (item: ChatCompletionsReasoningItem): boolean => item.summary?.some(part => part.text) === true;
-
 const flushPendingReasoningChunks = (state: ResponsesToChatCompletionsStreamState): ChatCompletionsStreamEvent[] => {
   if (state.reasoningItems.length === 0) return [];
 
@@ -79,7 +78,7 @@ const flushPendingReasoningChunks = (state: ResponsesToChatCompletionsStreamStat
 
 const isReasoningOutputDone = (event: ResponsesStreamEvent): boolean => {
   if (event.type !== 'response.output_item.done') return false;
-  return (event as ResponsesEvent<'response.output_item.done'>).item.type === 'reasoning';
+  return (event as Extract<ResponsesStreamEvent, { type: 'response.output_item.done' }>).item.type === 'reasoning';
 };
 
 const takeNextReadyDeferredResponseEvent = (state: ResponsesToChatCompletionsStreamState, onlyReasoningOutputDone: boolean): ResponsesStreamEvent | undefined => {
@@ -156,14 +155,15 @@ export const translateResponsesEventToChatCompletionsChunks = (event: ResponsesS
 
   switch (event.type) {
   case 'response.created': {
-    const { response } = event as ResponsesEvent<'response.created'>;
+    const { response } = event as Extract<ResponsesStreamEvent, { type: 'response.created' }>;
     state.messageId = response.id;
     state.model = response.model;
+    if (response.service_tier !== undefined) state.serviceTier = response.service_tier;
     return [makeChunk(state, { role: 'assistant' })];
   }
 
   case 'response.output_item.added': {
-    const { item, output_index } = event as ResponsesEvent<'response.output_item.added'>;
+    const { item, output_index } = event as Extract<ResponsesStreamEvent, { type: 'response.output_item.added' }>;
     if (item.type !== 'function_call') return [];
 
     state.toolCallIndex++;
@@ -187,7 +187,7 @@ export const translateResponsesEventToChatCompletionsChunks = (event: ResponsesS
   }
 
   case 'response.output_item.done': {
-    const { item, output_index } = event as ResponsesEvent<'response.output_item.done'>;
+    const { item, output_index } = event as Extract<ResponsesStreamEvent, { type: 'response.output_item.done' }>;
     if (item.type !== 'reasoning') return [];
 
     const chunks: ChatCompletionsStreamEvent[] = [];
@@ -203,18 +203,18 @@ export const translateResponsesEventToChatCompletionsChunks = (event: ResponsesS
   }
 
   case 'response.reasoning_summary_text.delta': {
-    const { delta, output_index, summary_index } = event as ResponsesEvent<'response.reasoning_summary_text.delta'>;
+    const { delta, output_index, summary_index } = event as Extract<ResponsesStreamEvent, { type: 'response.reasoning_summary_text.delta' }>;
     return emitReasoningSummaryText(output_index, summary_index, delta, state, 'delta');
   }
 
   case 'response.reasoning_summary_text.done': {
-    const { text, output_index, summary_index } = event as ResponsesEvent<'response.reasoning_summary_text.done'>;
+    const { text, output_index, summary_index } = event as Extract<ResponsesStreamEvent, { type: 'response.reasoning_summary_text.done' }>;
     queueReasoningSummaryDoneFallback(output_index, summary_index, text, state);
     return [];
   }
 
   case 'response.output_text.delta': {
-    const { delta, output_index, content_index } = event as ResponsesEvent<'response.output_text.delta'>;
+    const { delta, output_index, content_index } = event as Extract<ResponsesStreamEvent, { type: 'response.output_text.delta' }>;
     if (delta) {
       state.emittedTextContentKeys.add(responsesPartKey(output_index, content_index));
     }
@@ -222,7 +222,7 @@ export const translateResponsesEventToChatCompletionsChunks = (event: ResponsesS
   }
 
   case 'response.output_text.done': {
-    const { text, output_index, content_index } = event as ResponsesEvent<'response.output_text.done'>;
+    const { text, output_index, content_index } = event as Extract<ResponsesStreamEvent, { type: 'response.output_text.done' }>;
     const key = responsesPartKey(output_index, content_index);
     if (!text || state.emittedTextContentKeys.has(key)) return [];
 
@@ -230,19 +230,36 @@ export const translateResponsesEventToChatCompletionsChunks = (event: ResponsesS
     return [makeChunk(state, { content: text })];
   }
 
+  case 'response.refusal.delta': {
+    const { delta, output_index, content_index } = event as Extract<ResponsesStreamEvent, { type: 'response.refusal.delta' }>;
+    if (!delta) return [];
+
+    state.emittedTextContentKeys.add(responsesPartKey(output_index, content_index));
+    return [makeChunk(state, { refusal: delta })];
+  }
+
+  case 'response.refusal.done': {
+    const { refusal, output_index, content_index } = event as Extract<ResponsesStreamEvent, { type: 'response.refusal.done' }>;
+    const key = responsesPartKey(output_index, content_index);
+    if (!refusal || state.emittedTextContentKeys.has(key)) return [];
+
+    state.emittedTextContentKeys.add(key);
+    return [makeChunk(state, { refusal })];
+  }
+
   case 'response.content_part.done': {
-    const { part, output_index, content_index } = event as ResponsesEvent<'response.content_part.done'>;
+    const { part, output_index, content_index } = event as Extract<ResponsesStreamEvent, { type: 'response.content_part.done' }>;
     if (part.type !== 'refusal') return [];
 
     const key = responsesPartKey(output_index, content_index);
     if (!part.refusal || state.emittedTextContentKeys.has(key)) return [];
 
     state.emittedTextContentKeys.add(key);
-    return [makeChunk(state, { content: part.refusal })];
+    return [makeChunk(state, { refusal: part.refusal })];
   }
 
   case 'response.function_call_arguments.delta': {
-    const { delta, output_index } = event as ResponsesEvent<'response.function_call_arguments.delta'>;
+    const { delta, output_index } = event as Extract<ResponsesStreamEvent, { type: 'response.function_call_arguments.delta' }>;
     if (!delta) return [];
 
     const toolCallIndex = state.functionCallIndices.get(output_index);
@@ -262,7 +279,7 @@ export const translateResponsesEventToChatCompletionsChunks = (event: ResponsesS
   }
 
   case 'response.function_call_arguments.done': {
-    const { arguments: args, output_index } = event as ResponsesEvent<'response.function_call_arguments.done'>;
+    const { arguments: args, output_index } = event as Extract<ResponsesStreamEvent, { type: 'response.function_call_arguments.done' }>;
     if (!args || state.emittedFunctionArgumentOutputIndexes.has(output_index)) {
       return [];
     }
@@ -285,8 +302,9 @@ export const translateResponsesEventToChatCompletionsChunks = (event: ResponsesS
 
   case 'response.completed':
   case 'response.incomplete': {
-    const { response } = event as ResponsesEvent<'response.completed' | 'response.incomplete'>;
+    const { response } = event as Extract<ResponsesStreamEvent, { type: 'response.completed' | 'response.incomplete' }>;
     const chunks: ChatCompletionsStreamEvent[] = [];
+    if (response.service_tier !== undefined) state.serviceTier = response.service_tier;
 
     chunks.push(...flushReasoningSummaryDoneFallbacks(state));
     chunks.push(...flushPendingReasoningChunks(state));
@@ -314,6 +332,7 @@ const makeChunk = (state: ResponsesToChatCompletionsStreamState, delta: ChatComp
   object: 'chat.completion.chunk',
   created: state.created,
   model: state.model,
+  ...(state.serviceTier !== undefined ? { service_tier: state.serviceTier } : {}),
   choices: [
     {
       index: 0,
@@ -323,25 +342,39 @@ const makeChunk = (state: ResponsesToChatCompletionsStreamState, delta: ChatComp
   ],
 });
 
-const makeUsageChunk = (state: ResponsesToChatCompletionsStreamState, usage: NonNullable<ResponsesResult['usage']>): ChatCompletionsStreamEvent => ({
-  id: state.messageId,
-  object: 'chat.completion.chunk',
-  created: state.created,
-  model: state.model,
-  choices: [],
-  usage: {
-    prompt_tokens: usage.input_tokens,
-    completion_tokens: usage.output_tokens,
-    total_tokens: usage.total_tokens,
-    ...(usage.input_tokens_details?.cached_tokens !== undefined
-      ? {
-          prompt_tokens_details: {
-            cached_tokens: usage.input_tokens_details.cached_tokens,
-          },
-        }
-      : {}),
-  },
-});
+const makeUsageChunk = (
+  state: ResponsesToChatCompletionsStreamState,
+  usage: NonNullable<ResponsesResult['usage']>,
+): ChatCompletionsStreamEvent => {
+  splitInclusiveInputTokens(
+    usage.input_tokens,
+    usage.input_tokens_details?.cached_tokens,
+    usage.input_tokens_details?.cache_write_tokens,
+  );
+  return {
+    id: state.messageId,
+    object: 'chat.completion.chunk',
+    created: state.created,
+    model: state.model,
+    choices: [],
+    ...(state.serviceTier !== undefined ? { service_tier: state.serviceTier } : {}),
+    usage: {
+      prompt_tokens: usage.input_tokens,
+      completion_tokens: usage.output_tokens,
+      total_tokens: usage.total_tokens,
+      ...(usage.input_tokens_details?.cached_tokens !== undefined || usage.input_tokens_details?.cache_write_tokens !== undefined
+        ? {
+            prompt_tokens_details: {
+              ...(usage.input_tokens_details.cached_tokens !== undefined ? { cached_tokens: usage.input_tokens_details.cached_tokens } : {}),
+              ...(usage.input_tokens_details.cache_write_tokens !== undefined
+                ? { cache_creation_input_tokens: usage.input_tokens_details.cache_write_tokens }
+                : {}),
+            },
+          }
+        : {}),
+    },
+  };
+};
 
 interface ChatCompletionsErrorPayload {
   error: {
@@ -351,7 +384,6 @@ interface ChatCompletionsErrorPayload {
     name?: string;
     stack?: string;
     cause?: unknown;
-    source_api?: string;
     target_api?: string;
   };
 }
@@ -362,11 +394,10 @@ const debugFieldsFrom = (value: Record<string, unknown>) => ({
   ...(typeof value.name === 'string' ? { name: value.name } : {}),
   ...(typeof value.stack === 'string' ? { stack: value.stack } : {}),
   ...(value.cause !== undefined ? { cause: value.cause } : {}),
-  ...(typeof value.source_api === 'string' ? { source_api: value.source_api } : {}),
   ...(typeof value.target_api === 'string' ? { target_api: value.target_api } : {}),
 });
 
-const chatErrorPayloadFromResponsesError = (event: ResponsesEvent<'error'>): ChatCompletionsErrorPayload => ({
+const chatErrorPayloadFromResponsesError = (event: Extract<ResponsesStreamEvent, { type: 'error' }>): ChatCompletionsErrorPayload => ({
   error: {
     message: event.message,
     type: event.code ?? 'api_error',
@@ -374,14 +405,13 @@ const chatErrorPayloadFromResponsesError = (event: ResponsesEvent<'error'>): Cha
     ...(event.name ? { name: event.name } : {}),
     ...(event.stack ? { stack: event.stack } : {}),
     ...(event.cause !== undefined ? { cause: event.cause } : {}),
-    ...(event.source_api ? { source_api: event.source_api } : {}),
     ...(event.target_api ? { target_api: event.target_api } : {}),
   },
 });
 
 const isObjectLike = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
 
-const chatErrorPayloadFromResponsesFailure = (event: ResponsesEvent<'response.failed'>): ChatCompletionsErrorPayload => {
+const chatErrorPayloadFromResponsesFailure = (event: Extract<ResponsesStreamEvent, { type: 'response.failed' }>): ChatCompletionsErrorPayload => {
   const response = event.response as ResponsesResult;
   const error = isObjectLike(response.error) ? response.error : undefined;
 
@@ -399,17 +429,17 @@ const chatErrorFrameFromResponsesFatalEvent = (event: ResponsesStreamEvent): Pro
   if (event.type === 'error') {
     // OpenAI-compatible Chat streams can carry top-level error payloads;
     // ChatCompletionsStreamEvent only models successful chunk payloads.
-    return eventFrame(chatErrorPayloadFromResponsesError(event as ResponsesEvent<'error'>) as unknown as ChatCompletionsStreamEvent);
+    return eventFrame(chatErrorPayloadFromResponsesError(event as Extract<ResponsesStreamEvent, { type: 'error' }>) as unknown as ChatCompletionsStreamEvent);
   }
 
   if (event.type === 'response.failed') {
-    return eventFrame(chatErrorPayloadFromResponsesFailure(event as ResponsesEvent<'response.failed'>) as unknown as ChatCompletionsStreamEvent);
+    return eventFrame(chatErrorPayloadFromResponsesFailure(event as Extract<ResponsesStreamEvent, { type: 'response.failed' }>) as unknown as ChatCompletionsStreamEvent);
   }
 
   return undefined;
 };
 
-export const translateToSourceEvents = async function* (frames: AsyncIterable<ProtocolFrame<RawResponsesStreamEvent>>): AsyncGenerator<ProtocolFrame<ChatCompletionsStreamEvent>> {
+export const translateToSourceEvents = async function* (frames: AsyncIterable<ProtocolFrame<ResponsesStreamEvent>>): AsyncGenerator<ProtocolFrame<ChatCompletionsStreamEvent>> {
   const state = createResponsesToChatCompletionsStreamState();
 
   for await (const event of upstreamResponsesEventsUntilTerminal(frames)) {

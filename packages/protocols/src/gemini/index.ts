@@ -1,3 +1,4 @@
+
 export interface GeminiPayload {
   contents?: GeminiContent[];
   systemInstruction?: GeminiContent;
@@ -42,7 +43,7 @@ export interface GeminiGenerationConfig {
 
 export interface GeminiThinkingConfig {
   thinkingBudget?: number;
-  thinkingLevel?: 'minimal' | 'low' | 'medium' | 'high' | string;
+  thinkingLevel?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | (string & {});
   includeThoughts?: boolean;
 }
 
@@ -84,7 +85,15 @@ export interface GeminiResult {
 export interface GeminiCandidate {
   content: GeminiContent;
   finishReason?: GeminiFinishReason;
+  finishMessage?: string;
+  safetyRatings?: GeminiSafetyRating[];
   index: number;
+}
+
+export interface GeminiSafetyRating {
+  category: string;
+  probability: string;
+  blocked?: boolean;
 }
 
 export type GeminiFinishReason = 'STOP' | 'MAX_TOKENS' | 'SAFETY' | 'RECITATION' | 'OTHER' | 'MALFORMED_FUNCTION_CALL' | 'FINISH_REASON_UNSPECIFIED';
@@ -106,3 +115,8 @@ export interface GeminiErrorResponse {
 }
 
 export type GeminiStreamEvent = GeminiResult | GeminiErrorResponse;
+
+export { GEMINI_CANDIDATE_KEYS, GEMINI_RESULT_KEYS } from './field-keys.ts';
+export { GEMINI_MISSING_TERMINAL_MESSAGE, isGeminiErrorEvent, isGeminiTerminalEvent, collectGeminiProtocolEventsToResult } from './to-result.ts';
+export { reassembleGeminiEvents } from './reassemble.ts';
+export { geminiProtocolFrameToSSEFrame } from './to-sse.ts';

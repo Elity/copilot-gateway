@@ -14,11 +14,18 @@ export interface ResponsesSequenceState {
 }
 
 type OutputTextPart = Extract<ResponsesOutputContentBlock, { type: 'output_text' }>;
+type RefusalPart = Extract<ResponsesOutputContentBlock, { type: 'refusal' }>;
 type ResponsesUsage = NonNullable<ResponsesResult['usage']>;
 
-const textPart = (text: string): OutputTextPart => ({
+export const textPart = (text: string, annotations: Responses.ResponsesAnnotation[]): OutputTextPart => ({
   type: 'output_text',
   text,
+  annotations,
+});
+
+export const refusalPart = (refusal: string): RefusalPart => ({
+  type: 'refusal',
+  refusal,
 });
 
 const summaryPart = (text: string) => ({ type: 'summary_text' as const, text });
@@ -36,6 +43,15 @@ const outputTextEvent = (state: 'delta' | 'done', outputIndex: number, itemId: s
     output_index: outputIndex,
     content_index: 0,
     [state === 'delta' ? 'delta' : 'text']: text,
+  } as ResponsesStreamEvent);
+
+const refusalEvent = (state: 'delta' | 'done', outputIndex: number, itemId: string, refusal: string): ResponsesStreamEvent =>
+  ({
+    type: `response.refusal.${state}`,
+    item_id: itemId,
+    output_index: outputIndex,
+    content_index: 0,
+    [state === 'delta' ? 'delta' : 'refusal']: refusal,
   } as ResponsesStreamEvent);
 
 const functionCallArgumentsEvent = (state: 'delta' | 'done', outputIndex: number, itemId: string, text: string): ResponsesStreamEvent =>
@@ -77,13 +93,6 @@ export const seq = (state: ResponsesSequenceState, events: ResponsesStreamEvent[
     sequence_number: state.sequenceNumber++,
   }));
 
-export const usage = (inputTokens: number, outputTokens: number, cacheReadInputTokens?: number): ResponsesUsage => ({
-  input_tokens: inputTokens,
-  output_tokens: outputTokens,
-  total_tokens: inputTokens + outputTokens,
-  ...(cacheReadInputTokens !== undefined ? { input_tokens_details: { cached_tokens: cacheReadInputTokens } } : {}),
-});
-
 // `incompleteDetails` is an explicit caller-supplied input. Inferring
 // it from `status === 'incomplete'` alone would have to hard-code a
 // reason — current callers all map to `'max_output_tokens'`, but a
@@ -98,6 +107,8 @@ export const result = (input: {
   status: ResponsesResult['status'];
   usage?: ResponsesUsage;
   incompleteDetails?: ResponsesResult['incomplete_details'];
+  error?: ResponsesResult['error'];
+  serviceTier?: ResponsesResult['service_tier'];
 }): ResponsesResult => ({
   id: input.id,
   object: 'response',
@@ -108,23 +119,22 @@ export const result = (input: {
   // `error` and `incomplete_details` are spec-required on every
   // Response (both nullable). Default both to null; callers pass a
   // concrete value when the source carries one.
-  error: null,
+  error: input.error ?? null,
   incomplete_details: input.incompleteDetails ?? null,
   ...(input.usage !== undefined ? { usage: input.usage } : {}),
+  ...(input.serviceTier !== undefined ? { service_tier: input.serviceTier } : {}),
 });
 
-// Every output item carries its own `id` so that, when a Responses client is
-// routed to a non-Responses upstream, the synthesized stream looks like a
-// native Responses one: the id on `output_item.added`/`.done` matches the
-// `item_id` of every child frame, and the source-serve persistence layer can
-// mint a stored id and record the item. Ids are derived from the item's
-// output index (see the `msg_`/`fc_`/`ctc_`/`rs_` callers), so they are stable
-// within a response and do not parse as gateway stored ids.
-export const messageItem = (id: string, text: string): ResponsesOutputMessage => ({
+// A translated producer allocates one item ID when the lifecycle opens and
+// reuses it across added, child, done, and terminal frames. Taking the built
+// content part rather than its text keeps the item and the `content_part`
+// frames carrying one identical part.
+export const messageItem = (id: string, status: 'in_progress' | 'completed', part: ResponsesOutputContentBlock): ResponsesOutputMessage => ({
   type: 'message',
   id,
+  status,
   role: 'assistant',
-  content: [textPart(text)],
+  content: [part],
 });
 
 export const reasoningItem = (id: string, summaryText: string, encryptedContent?: string): ResponsesOutputReasoning => ({
@@ -134,11 +144,19 @@ export const reasoningItem = (id: string, summaryText: string, encryptedContent?
   ...(encryptedContent !== undefined ? { encrypted_content: encryptedContent } : {}),
 });
 
-export const functionCallItem = (id: string, callId: string, name: string, args: string, status: ResponsesOutputFunctionCall['status']): ResponsesOutputFunctionCall => ({
+export const functionCallItem = (
+  id: string,
+  callId: string,
+  name: string,
+  args: string,
+  status: ResponsesOutputFunctionCall['status'],
+  namespace?: string,
+): ResponsesOutputFunctionCall => ({
   type: 'function_call',
   id,
   call_id: callId,
   name,
+  ...(namespace !== undefined ? { namespace } : {}),
   arguments: args,
   status,
 });
@@ -161,12 +179,19 @@ export const started = (state: ResponsesSequenceState, response: ResponsesResult
   ]);
 
 export const terminal = (state: ResponsesSequenceState, response: ResponsesResult) => {
-  if (response.status === 'in_progress') {
-    throw new Error('Cannot emit a terminal Responses event for in_progress');
+  let type: 'response.completed' | 'response.incomplete' | 'response.failed';
+  switch (response.status) {
+  case 'completed': type = 'response.completed'; break;
+  case 'incomplete': type = 'response.incomplete'; break;
+  case 'failed': type = 'response.failed'; break;
+  case 'queued':
+  case 'in_progress':
+  case 'cancelled':
+    throw new TypeError(`Cannot emit a terminal Responses event for status '${response.status}'`);
   }
   return seq(state, [
     {
-      type: response.status === 'incomplete' ? 'response.incomplete' : response.status === 'failed' ? 'response.failed' : 'response.completed',
+      type,
       response,
     },
   ]);
@@ -175,30 +200,62 @@ export const terminal = (state: ResponsesSequenceState, response: ResponsesResul
 export const itemAdded = (state: ResponsesSequenceState, outputIndex: number, item: ResponsesOutputItem) =>
   seq(state, [outputItemEvent('added', outputIndex, item)]);
 
-export const textStart = (state: ResponsesSequenceState, outputIndex: number, itemId: string) =>
-  seq(state, [
-    outputItemEvent('added', outputIndex, messageItem(itemId, '')),
+export const textStart = (state: ResponsesSequenceState, outputIndex: number, itemId: string) => {
+  const part = textPart('', []);
+  return seq(state, [
+    outputItemEvent('added', outputIndex, messageItem(itemId, 'in_progress', part)),
     {
       type: 'response.content_part.added',
       item_id: itemId,
       output_index: outputIndex,
       content_index: 0,
-      part: textPart(''),
+      part,
     },
   ]);
+};
 
 export const textDelta = (state: ResponsesSequenceState, outputIndex: number, itemId: string, delta: string) =>
   seq(state, [outputTextEvent('delta', outputIndex, itemId, delta)]);
 
-export const textDone = (state: ResponsesSequenceState, outputIndex: number, itemId: string, text: string, item: ResponsesOutputMessage) =>
+export const textDone = (state: ResponsesSequenceState, outputIndex: number, itemId: string, part: OutputTextPart, item: ResponsesOutputMessage) =>
   seq(state, [
-    outputTextEvent('done', outputIndex, itemId, text),
+    outputTextEvent('done', outputIndex, itemId, part.text),
     {
       type: 'response.content_part.done',
       item_id: itemId,
       output_index: outputIndex,
       content_index: 0,
-      part: textPart(text),
+      part,
+    },
+    outputItemEvent('done', outputIndex, item),
+  ]);
+
+export const refusalStart = (state: ResponsesSequenceState, outputIndex: number, itemId: string) => {
+  const part = refusalPart('');
+  return seq(state, [
+    outputItemEvent('added', outputIndex, messageItem(itemId, 'in_progress', part)),
+    {
+      type: 'response.content_part.added',
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      part,
+    },
+  ]);
+};
+
+export const refusalDelta = (state: ResponsesSequenceState, outputIndex: number, itemId: string, delta: string) =>
+  seq(state, [refusalEvent('delta', outputIndex, itemId, delta)]);
+
+export const refusalDone = (state: ResponsesSequenceState, outputIndex: number, itemId: string, part: RefusalPart, item: ResponsesOutputMessage) =>
+  seq(state, [
+    refusalEvent('done', outputIndex, itemId, part.refusal),
+    {
+      type: 'response.content_part.done',
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      part,
     },
     outputItemEvent('done', outputIndex, item),
   ]);

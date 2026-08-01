@@ -7,14 +7,16 @@ import {
   geminiPartKind,
   geminiPartText,
   geminiReasoningEffort,
-  geminiReasoningId,
   geminiText,
   geminiThoughtText,
   type GeminiToolCallIds,
   geminiVisibleText,
 } from '../shared/gemini-via/gemini.ts';
+import { TranslatorInputError } from '../translator-input-error.ts';
 import type { GeminiContent, GeminiPayload, GeminiGenerationConfig, GeminiPart } from '@floway-dev/protocols/gemini';
-import type { ResponsesInputContent, ResponsesInputItem, ResponsesPayload, ResponsesTool } from '@floway-dev/protocols/responses';
+import type { CanonicalResponsesPayload, ResponsesInputContent, ResponsesInputItem, ResponsesTool } from '@floway-dev/protocols/responses';
+
+const geminiReasoningId = (turnIndex: number, partIndex: number): string => `gemini_reasoning_${turnIndex}_${partIndex}`;
 
 const flushPendingContent = (input: ResponsesInputItem[], pending: ResponsesInputContent[], role: 'user' | 'assistant'): void => {
   if (pending.length === 0) return;
@@ -29,7 +31,6 @@ const inlineDataToInputImage = (part: GeminiPart): ResponsesInputContent | null 
   return {
     type: 'input_image',
     image_url: imageUrl,
-    detail: 'auto',
   };
 };
 
@@ -64,7 +65,7 @@ const buildUserInputItems = (content: GeminiContent, turnIndex: number, unmatche
       return;
     }
     default:
-      throw new Error(`Gemini → Responses translator does not accept ${kind} parts in user content.`);
+      throw new TranslatorInputError(`"${kind}" parts are not supported in user content.`);
     }
   });
 
@@ -109,7 +110,7 @@ const buildAssistantInputItems = (content: GeminiContent, turnIndex: number, unm
       return;
     }
     default:
-      throw new Error(`Gemini → Responses translator does not accept ${kind} parts in model content.`);
+      throw new TranslatorInputError(`"${kind}" parts are not supported in model content.`);
     }
   });
 
@@ -117,7 +118,7 @@ const buildAssistantInputItems = (content: GeminiContent, turnIndex: number, unm
   return input;
 };
 
-const applyGenerationConfig = (request: ResponsesPayload, generationConfig?: GeminiGenerationConfig): void => {
+const applyGenerationConfig = (request: CanonicalResponsesPayload, generationConfig?: GeminiGenerationConfig): void => {
   if (!generationConfig) return;
 
   if (generationConfig.maxOutputTokens !== undefined) {
@@ -132,6 +133,7 @@ const applyGenerationConfig = (request: ResponsesPayload, generationConfig?: Gem
 
   if (generationConfig.responseSchema !== undefined) {
     request.text = {
+      ...request.text,
       format: {
         type: 'json_schema',
         json_schema: {
@@ -141,11 +143,11 @@ const applyGenerationConfig = (request: ResponsesPayload, generationConfig?: Gem
       },
     };
   } else if (generationConfig.responseMimeType === 'application/json') {
-    request.text = { format: { type: 'json_object' } };
+    request.text = { ...request.text, format: { type: 'json_object' } };
   }
 
   const effort = geminiReasoningEffort(generationConfig.thinkingConfig);
-  if (!effort) return;
+  if (effort === null) return;
 
   request.reasoning = {
     effort,
@@ -165,8 +167,8 @@ const buildTools = (payload: GeminiPayload): ResponsesTool[] | undefined => {
   return tools.length ? tools : undefined;
 };
 
-export const buildTargetRequest = (payload: GeminiPayload, model: string): ResponsesPayload => {
-  const request: ResponsesPayload = {
+export const buildTargetRequest = (payload: GeminiPayload, model: string): CanonicalResponsesPayload => {
+  const request: CanonicalResponsesPayload = {
     model,
     stream: true,
     input: [],
@@ -187,7 +189,7 @@ export const buildTargetRequest = (payload: GeminiPayload, model: string): Respo
       input.push(...buildUserInputItems(content, turnIndex, unmatchedToolCallIds));
       return;
     default:
-      throw new Error(`Gemini → Responses translator does not accept ${(content as { role: string }).role} content roles.`);
+      throw new TranslatorInputError(`"${(content as { role: string }).role}" is not a supported content role.`);
     }
   });
 

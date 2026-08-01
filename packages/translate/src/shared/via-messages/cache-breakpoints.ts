@@ -22,16 +22,14 @@
 
 import type {
   MessagesAssistantContentBlock,
-  MessagesImageBlock,
+  MessagesCacheControl,
   MessagesMessage,
   MessagesTextBlock,
   MessagesTool,
-  MessagesToolResultBlock,
-  MessagesToolUseBlock,
   MessagesUserContentBlock,
 } from '@floway-dev/protocols/messages';
 
-export const EPHEMERAL_CACHE_CONTROL = { type: 'ephemeral' } as const;
+export const EPHEMERAL_CACHE_CONTROL: MessagesCacheControl = { type: 'ephemeral' };
 
 export const applyLastToolCacheBreakpoint = (tools: MessagesTool[] | undefined): void => {
   if (!tools || tools.length === 0) return;
@@ -47,26 +45,26 @@ export const applyLastToolCacheBreakpoint = (tools: MessagesTool[] | undefined):
   }
 };
 
-type CacheableContentBlock = MessagesTextBlock | MessagesImageBlock | MessagesToolUseBlock | MessagesToolResultBlock;
-
-const isCacheableBlock = (block: MessagesUserContentBlock | MessagesAssistantContentBlock): block is CacheableContentBlock =>
-  block.type === 'text' || block.type === 'image' || block.type === 'tool_use' || block.type === 'tool_result';
+export const applyLastSystemCacheBreakpoint = (system: MessagesTextBlock[] | undefined): void => {
+  if (!system || system.length === 0) return;
+  system[system.length - 1].cache_control = EPHEMERAL_CACHE_CONTROL;
+};
 
 export const applyLastMessageCacheBreakpoint = (messages: MessagesMessage[]): void => {
   for (let m = messages.length - 1; m >= 0; m--) {
     const message = messages[m];
 
     if (typeof message.content === 'string') {
-      // MessagesTextBlock is valid in both the user and assistant content
-      // unions, so the union cast lets one literal serve either role.
+      // MessagesTextBlock is valid in the user, assistant, and system content
+      // unions, so the union cast lets one literal serve any of the three roles.
       const block: MessagesTextBlock = { type: 'text', text: message.content, cache_control: EPHEMERAL_CACHE_CONTROL };
-      message.content = [block] as MessagesUserContentBlock[] | MessagesAssistantContentBlock[];
+      message.content = [block] as MessagesUserContentBlock[] | MessagesAssistantContentBlock[] | MessagesTextBlock[];
       return;
     }
 
     for (let b = message.content.length - 1; b >= 0; b--) {
       const block = message.content[b];
-      if (isCacheableBlock(block)) {
+      if (block.type === 'text' || block.type === 'image' || block.type === 'tool_use' || block.type === 'tool_result') {
         block.cache_control = EPHEMERAL_CACHE_CONTROL;
         return;
       }

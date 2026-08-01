@@ -3,6 +3,16 @@
 
 // ── Request types ──
 
+// Supported for gpt-5.6+. Slots remain open-string so future modes and
+// lifetimes reach the upstream unchanged.
+// https://github.com/openai/openai-python/blob/f16fbbd2bd25dc1ff150b5f78dbd15ff6bab6d91/src/openai/types/responses/response_compact_params.py#L144-L184
+export interface ResponsesPromptCacheOptions {
+  mode?: 'implicit' | 'explicit' | (string & {});
+  ttl?: '30m' | (string & {});
+}
+
+export type ResponsesPromptCacheRetention = 'in_memory' | '24h' | (string & {});
+
 export interface ResponsesPayload {
   model: string;
   input: string | ResponsesInputItem[];
@@ -19,20 +29,55 @@ export interface ResponsesPayload {
   // https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_create_params.py
   max_tool_calls?: number | null;
   tools?: ResponsesTool[] | null;
-  tool_choice?: ResponsesToolChoice;
+  tool_choice?: ResponsesToolChoice | null;
   metadata?: Record<string, unknown> | null;
   stream?: boolean | null;
   store?: boolean | null;
   parallel_tool_calls?: boolean | null;
   reasoning?: {
     effort?: string;
-    summary?: 'detailed' | 'auto' | 'concise';
+    summary?: 'detailed' | 'auto' | 'concise' | (string & {});
+    // Controls which reasoning items are rendered back to the model on later
+    // turns; echoed on the response as the effective mode. Canonical values are
+    // `auto` / `current_turn` / `all_turns`, but the slot stays open-string so
+    // future upstream modes forward verbatim rather than being narrowed at this
+    // boundary. Reference (openai-python shared Reasoning.context):
+    // https://github.com/openai/openai-python/blob/f16fbbd2bd25dc1ff150b5f78dbd15ff6bab6d91/src/openai/types/shared/reasoning.py#L19-L25
+    // Reference (openai-node Reasoning.context):
+    // https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/shared.ts#L262-L269
+    context?: 'auto' | 'current_turn' | 'all_turns' | (string & {}) | null;
   };
   include?: string[];
-  text?: { format?: Record<string, unknown> | null } | null;
+  // `text.verbosity` is a native GPT-5-family Responses field that controls
+  // response length; `text.format` carries structured-output schemas. Both
+  // ride on the same `text` object.
+  // Reference: https://platform.openai.com/docs/api-reference/responses/create
+  text?: { format?: Record<string, unknown> | null; verbosity?: string | null } | null;
   prompt_cache_key?: string | null;
+  prompt_cache_options?: ResponsesPromptCacheOptions | null;
+  prompt_cache_retention?: ResponsesPromptCacheRetention | null;
   safety_identifier?: string | null;
-  service_tier?: string | null;
+  service_tier?: 'default' | 'auto' | 'flex' | 'priority' | 'scale' | (string & {}) | null;
+  // Request knobs Floway itself never acts on. On a Responses-native target
+  // they ride to the upstream in the forwarded body and come back echoed; no
+  // translate pair carries them, so on a translated target the client-facing
+  // echo can only come from the request. Declaring them keeps that echo honest
+  // instead of hard-coding the spec default for a client that sent its own
+  // value.
+  // https://github.com/openai/openai-openapi/blob/db14b6e1712aaf5265cf5a6871adff7a9c61d31c/openapi.yaml#L35856-L35873
+  truncation?: 'auto' | 'disabled' | (string & {}) | null;
+  // https://github.com/openai/openai-openapi/blob/db14b6e1712aaf5265cf5a6871adff7a9c61d31c/openapi.yaml#L59062-L59068
+  background?: boolean | null;
+  // https://github.com/openai/openai-openapi/blob/db14b6e1712aaf5265cf5a6871adff7a9c61d31c/openapi.yaml#L44064-L44080
+  top_logprobs?: number | null;
+  // Chat Completions sampling penalties. OpenAI's Responses request schema
+  // does not carry them, but the OpenResponses request and response schemas
+  // both do, so a client may send them and expects them echoed.
+  // https://github.com/openresponses/openresponses/blob/92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c/public/openapi/openapi.json#L2691-L2723
+  // https://github.com/openai/openai-openapi/blob/db14b6e1712aaf5265cf5a6871adff7a9c61d31c/openapi.yaml#L32766-L32771
+  presence_penalty?: number | null;
+  // https://github.com/openai/openai-openapi/blob/db14b6e1712aaf5265cf5a6871adff7a9c61d31c/openapi.yaml#L32752-L32757
+  frequency_penalty?: number | null;
 }
 
 export type ResponsesInputItem =
@@ -49,7 +94,15 @@ export type ResponsesInputItem =
   | ResponsesComputerCallOutputItem
   | ResponsesToolSearchCallItem
   | ResponsesToolSearchOutputItem
+  | ResponsesInputAdditionalToolsItem
+  | ResponsesProgramItem
+  | ResponsesProgramOutputItem
+  | ResponsesInputAgentMessageItem
+  | ResponsesInputMultiAgentCallItem
+  | ResponsesInputMultiAgentCallOutputItem
+  | ResponsesContextCompactionItem
   | ResponsesCompactionItem
+  | ResponsesCompactionTriggerItem
   | ResponsesInputImageGenerationCall
   | ResponsesCodeInterpreterCallItem
   | ResponsesLocalShellCallItem
@@ -63,25 +116,91 @@ export type ResponsesInputItem =
   | ResponsesMcpApprovalRequestItem
   | ResponsesMcpApprovalResponseItem;
 
+export type ResponsesMessagePhase = 'commentary' | 'final_answer' | (string & {}) | null;
+
 export interface ResponsesInputMessage {
   type: 'message';
   id?: string;
   status?: string;
   role: 'user' | 'assistant' | 'system' | 'developer';
   content: string | ResponsesInputContent[];
+  phase?: ResponsesMessagePhase;
 }
 
-export type ResponsesInputContent = ResponsesInputText | ResponsesInputImage;
+// The Responses request schema's EasyInputMessage makes the constant
+// `type: "message"` discriminator optional. Wire-facing payloads accept that
+// shorthand; gateway and translator boundaries normalize it before internal
+// item processing so the canonical union remains explicitly discriminated.
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L697-L721
+export interface ResponsesEasyInputMessage {
+  content: string | ResponsesInputContent[];
+  role: 'user' | 'assistant' | 'system' | 'developer';
+  phase?: ResponsesMessagePhase;
+  type?: 'message';
+}
+
+export type ResponsesRequestInputItem =
+  | ResponsesEasyInputMessage
+  | ResponsesInputItem;
+
+export type ResponsesRequestPayload = Omit<ResponsesPayload, 'input'> & {
+  input: string | ResponsesRequestInputItem[];
+};
+
+export type CanonicalResponsesPayload = Omit<ResponsesPayload, 'input'> & {
+  input: ResponsesInputItem[];
+};
+
+export type ResponsesInputContent = ResponsesInputText | ResponsesInputImage | ResponsesInputFile | ResponsesOutputRefusal;
+
+// Explicit content breakpoints inherit their lifetime from
+// `prompt_cache_options.ttl`. The mode stays open-string for forward
+// compatibility.
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L5009-L5038
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L3973-L3993
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L3864-L3884
+export interface ResponsesPromptCacheBreakpoint {
+  mode: 'explicit' | (string & {});
+}
 
 export interface ResponsesInputText {
   type: 'input_text' | 'output_text';
   text: string;
+  prompt_cache_breakpoint?: ResponsesPromptCacheBreakpoint | null;
 }
 
 export interface ResponsesInputImage {
+  // OpenAI splits this part in two: `ResponseInputImageContent` /
+  // `InputImageContentParamAutoParam` is the request-side shape and leaves
+  // `detail` optional and nullable, while `ResponseInputImage` /
+  // `InputImageContent` requires it and is the response-side echo. This
+  // interface types requests, so it follows the former. Omitting `detail`
+  // means `auto` on both Responses and Chat Completions.
+  // https://web.archive.org/web/20260730100926/https://developers.openai.com/api/docs/guides/images-vision.md
+  // Request side:
+  // https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L4000-L4029
+  // https://github.com/openai/openai-openapi/blob/db3e53198a66732cfe161339ea63bf36fc0137ad/openapi.yaml#L67923-L67961
+  // Response side:
+  // https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L3951-L3980
+  // https://github.com/openai/openai-openapi/blob/db3e53198a66732cfe161339ea63bf36fc0137ad/openapi.yaml#L65928-L65961
   type: 'input_image';
-  image_url: string;
-  detail: 'auto' | 'low' | 'high';
+  image_url?: string | null;
+  file_id?: string | null;
+  detail?: 'auto' | 'low' | 'high' | 'original' | (string & {}) | null;
+  prompt_cache_breakpoint?: ResponsesPromptCacheBreakpoint | null;
+}
+
+export type ResponsesToolOutputContent = ResponsesInputText | ResponsesInputImage | ResponsesInputFile;
+
+export interface ResponsesInputFile {
+  type: 'input_file';
+  detail?: 'auto' | 'low' | 'high';
+  file_data?: string;
+  file_id?: string | null;
+  file_url?: string;
+  filename?: string;
+  prompt_cache_breakpoint?: ResponsesPromptCacheBreakpoint | null;
+  [key: string]: unknown;
 }
 
 export interface ResponsesInputReasoning {
@@ -96,13 +215,21 @@ export interface ResponsesInputReasoning {
   encrypted_content?: string;
 }
 
+// OpenAI Responses Programmatic Tool Calling caller shape.
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L3394-L3407
+export type ResponsesToolCaller =
+  | { type: 'direct' }
+  | { type: 'program'; caller_id: string };
+
 export interface ResponsesFunctionToolCallItem {
   type: 'function_call';
   id?: string;
   call_id: string;
   name: string;
+  namespace?: string;
   arguments: string;
   status: 'completed' | 'in_progress' | 'incomplete';
+  caller?: ResponsesToolCaller | null;
 }
 
 export interface ResponsesFunctionCallOutputItem {
@@ -111,8 +238,9 @@ export interface ResponsesFunctionCallOutputItem {
   call_id: string;
   // Multimodal tool outputs carry an array of content parts (e.g. a screenshot
   // tool returning `input_image` parts) in addition to the plain-string form.
-  output: string | ResponsesInputContent[];
+  output: string | ResponsesToolOutputContent[];
   status?: 'completed' | 'incomplete';
+  caller?: ResponsesToolCaller | null;
 }
 
 // Freeform custom tool invocation echoed back to the model in conversation
@@ -126,14 +254,16 @@ export interface ResponsesCustomToolCallItem {
   id?: string;
   namespace?: string;
   status?: string;
+  caller?: ResponsesToolCaller | null;
 }
 
 export interface ResponsesCustomToolCallOutputItem {
   type: 'custom_tool_call_output';
   call_id: string;
-  output: string;
+  output: string | ResponsesToolOutputContent[];
   id?: string;
   status?: string;
+  caller?: ResponsesToolCaller | null;
 }
 
 export interface ResponsesItemReference {
@@ -162,90 +292,341 @@ export interface ResponsesPermissiveItem<TType extends string> {
   [key: string]: unknown;
 }
 
-export interface ResponsesFileSearchCallItem extends ResponsesPermissiveItem<'file_search_call'> {
-  queries?: string[];
-  results?: unknown[];
+export interface ResponsesFileSearchResult {
+  attributes?: Record<string, string | number | boolean> | null;
+  file_id?: string;
+  filename?: string;
+  score?: number;
+  text?: string;
 }
 
-export interface ResponsesComputerCallItem extends ResponsesPermissiveItem<'computer_call'> {
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L2909-L2980
+export interface ResponsesFileSearchCallItem {
+  type: 'file_search_call';
+  id: string;
+  queries: string[];
+  status: string;
+  results?: ResponsesFileSearchResult[] | null;
+}
+
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L298-L535
+export type ResponsesComputerAction =
+  | { type: 'click'; button: 'left' | 'right' | 'wheel' | 'back' | 'forward'; x: number; y: number; keys?: string[] | null }
+  | { type: 'double_click'; keys: string[] | null; x: number; y: number }
+  | { type: 'drag'; path: Array<{ x: number; y: number }>; keys?: string[] | null }
+  | { type: 'keypress'; keys: string[] }
+  | { type: 'move'; x: number; y: number; keys?: string[] | null }
+  | { type: 'screenshot' }
+  | { type: 'scroll'; scroll_x: number; scroll_y: number; x: number; y: number; keys?: string[] | null }
+  | { type: 'type'; text: string }
+  | { type: 'wait' };
+
+export interface ResponsesComputerSafetyCheck {
+  id: string;
+  code?: string | null;
+  message?: string | null;
+}
+
+// Modern `computer` emits `actions` and rejects even an empty
+// `pending_safety_checks`; the legacy `computer_use_preview` shape uses the
+// singular `action` plus safety checks. Keep both wire generations explicit.
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L1990-L2035
+// https://github.com/Menci/Floway/pull/246#issuecomment-5028154071
+interface ResponsesComputerCallItemBase {
+  type: 'computer_call';
+  id: string;
   call_id: string;
-  action?: unknown;
-  pending_safety_checks?: unknown[];
+  status: string;
 }
 
-export interface ResponsesComputerCallOutputItem extends ResponsesPermissiveItem<'computer_call_output'> {
+export type ResponsesComputerCallItem = ResponsesComputerCallItemBase & (
+  | {
+    actions: ResponsesComputerAction[];
+    action?: never;
+    pending_safety_checks?: never;
+  }
+  | {
+    action: ResponsesComputerAction;
+    actions?: never;
+    pending_safety_checks: ResponsesComputerSafetyCheck[];
+  }
+);
+
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L2280-L2359
+export interface ResponsesComputerCallOutputItem {
+  type: 'computer_call_output';
+  id?: string | null;
   call_id: string;
-  output?: unknown;
-  acknowledged_safety_checks?: unknown[];
+  output: {
+    type: 'computer_screenshot';
+    file_id?: string;
+    image_url?: string;
+  };
+  acknowledged_safety_checks?: ResponsesComputerSafetyCheck[] | null;
+  status?: string | null;
+  created_by?: string;
 }
 
-export interface ResponsesToolSearchCallItem extends ResponsesPermissiveItem<'tool_search_call'> {
-  call_id?: string;
-  query?: string;
-  results?: unknown[];
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L7119-L7223
+export interface ResponsesToolSearchCallItem {
+  type: 'tool_search_call';
+  arguments: unknown;
+  id?: string | null;
+  call_id?: string | null;
+  execution?: 'server' | 'client';
+  status?: string | null;
+  created_by?: string;
+  internal_chat_message_metadata_passthrough?: Record<string, unknown>;
 }
 
-export interface ResponsesToolSearchOutputItem extends ResponsesPermissiveItem<'tool_search_output'> {
-  call_id?: string;
-  output?: unknown;
+export interface ResponsesToolSearchOutputItem {
+  type: 'tool_search_output';
+  tools: ResponsesTool[];
+  id?: string | null;
+  call_id?: string | null;
+  execution?: 'server' | 'client';
+  status?: string | null;
+  created_by?: string;
+  internal_chat_message_metadata_passthrough?: Record<string, unknown>;
 }
 
-export type ResponsesCompactionItem = ResponsesPermissiveItem<'compaction'>;
-
-export interface ResponsesCodeInterpreterCallItem extends ResponsesPermissiveItem<'code_interpreter_call'> {
-  call_id?: string;
-  code?: string;
-  results?: unknown[];
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L4265-L4285
+export interface ResponsesInputAdditionalToolsItem {
+  type: 'additional_tools';
+  role: 'developer';
+  tools: ResponsesTool[];
+  id?: string | null;
 }
 
-export interface ResponsesLocalShellCallItem extends ResponsesPermissiveItem<'local_shell_call'> {
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L4919-L4971
+export interface ResponsesProgramItem {
+  type: 'program';
+  id: string;
   call_id: string;
-  command?: string;
+  code: string;
+  fingerprint: string;
 }
 
-export interface ResponsesLocalShellCallOutputItem extends ResponsesPermissiveItem<'local_shell_call_output'> {
+export interface ResponsesProgramOutputItem {
+  type: 'program_output';
+  id: string;
   call_id: string;
-  output?: unknown;
+  result: string;
+  status: 'completed' | 'incomplete';
 }
 
-export interface ResponsesShellCallItem extends ResponsesPermissiveItem<'shell_call'> {
+// OpenAI beta Responses multi-agent item shapes.
+// https://github.com/openai/openai-node/blob/228c224393ef4bf3bda2a9d7eb40f387499299b5/src/resources/beta/responses/responses.ts#L6549-L6805
+export type ResponsesAgentMessageContent =
+  | ResponsesInputText
+  | ResponsesInputImage
+  | ResponsesInputFile
+  | { type: 'text' | 'summary_text' | 'reasoning_text'; text: string }
+  | { type: 'refusal'; refusal: string }
+  | { type: 'computer_screenshot'; image_url: string | null; file_id: string | null; detail?: 'auto' | 'low' | 'high' | 'original' | (string & {}) | null }
+  | { type: 'encrypted_content'; encrypted_content: string }
+  | (Record<string, unknown> & { type: string });
+
+export interface ResponsesInputAgentMessageItem {
+  type: 'agent_message';
+  author: string;
+  recipient: string;
+  content: ResponsesAgentMessageContent[];
+  id?: string | null;
+  agent?: { agent_name: string } | null;
+  internal_chat_message_metadata_passthrough?: Record<string, unknown>;
+}
+
+export type ResponsesMultiAgentAction =
+  | 'spawn_agent'
+  | 'interrupt_agent'
+  | 'list_agents'
+  | 'send_message'
+  | 'followup_task'
+  | 'wait_agent';
+
+export interface ResponsesInputMultiAgentCallItem {
+  type: 'multi_agent_call';
+  action: ResponsesMultiAgentAction;
+  arguments: string;
   call_id: string;
-  command?: string;
+  id?: string | null;
+  agent?: { agent_name: string } | null;
 }
 
-export interface ResponsesShellCallOutputItem extends ResponsesPermissiveItem<'shell_call_output'> {
+export interface ResponsesInputMultiAgentCallOutputItem {
+  type: 'multi_agent_call_output';
+  action: ResponsesMultiAgentAction;
   call_id: string;
-  output?: unknown;
+  output: Array<Record<string, unknown> & { type: 'output_text'; text: string }>;
+  id?: string | null;
+  agent?: { agent_name: string } | null;
 }
 
-export interface ResponsesApplyPatchCallItem extends ResponsesPermissiveItem<'apply_patch_call'> {
+// Legacy RemoteCompactionV2 history shape. Current OpenAI Responses uses
+// `compaction_trigger` input and `compaction` output; Codex still deserializes
+// this form when replaying older rollouts.
+// https://github.com/openai/codex/blob/9e552e9d15ba52bed7077d5357f3e18e330f8f38/codex-rs/protocol/src/models.rs#L1135-L1148
+export interface ResponsesContextCompactionItem extends ResponsesPermissiveItem<'context_compaction'> {
+  encrypted_content?: string;
+  internal_chat_message_metadata_passthrough?: Record<string, unknown>;
+}
+
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L1918-L1963
+export interface ResponsesCompactionItem {
+  type: 'compaction';
+  id?: string | null;
+  encrypted_content: string;
+  created_by?: string;
+}
+
+// Payload-free trailing input item for a RemoteCompactionV2 round trip.
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L4894-L4902
+export interface ResponsesCompactionTriggerItem {
+  type: 'compaction_trigger';
+}
+
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L1852-L1915
+export interface ResponsesCodeInterpreterCallItem {
+  type: 'code_interpreter_call';
+  id: string;
+  code: string | null;
+  container_id: string;
+  outputs: Array<
+    | { type: 'logs'; logs: string }
+    | { type: 'image'; url: string }
+  > | null;
+  status: string;
+}
+
+// Legacy local-shell output is opaque text correlated by `call_id`; modern
+// shell output uses structured stdout/stderr/outcome chunks below.
+// https://github.com/openai/openai-agents-python/blob/2fa463571e76dae8ff267622f1018eaf06ffeb9f/tests/test_local_shell_tool.py#L46-L92
+export interface ResponsesLocalShellCallItem {
+  type: 'local_shell_call';
+  id: string;
   call_id: string;
-  patch?: string;
+  action: {
+    type: 'exec';
+    command: string[];
+    env: Record<string, string>;
+    timeout_ms?: number | null;
+    user?: string | null;
+    working_directory?: string | null;
+  };
+  status: string;
 }
 
-export interface ResponsesApplyPatchCallOutputItem extends ResponsesPermissiveItem<'apply_patch_call_output'> {
+export interface ResponsesLocalShellCallOutputItem {
+  type: 'local_shell_call_output';
+  id?: string | null;
   call_id: string;
-  output?: unknown;
+  output: string;
+  status?: string | null;
 }
 
-export interface ResponsesMcpCallItem extends ResponsesPermissiveItem<'mcp_call'> {
+export type ResponsesShellEnvironment =
+  | { type: 'local' }
+  | { type: 'container_reference'; container_id: string };
+
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L3154-L3344
+export interface ResponsesShellCallItem {
+  type: 'shell_call';
+  id?: string | null;
   call_id: string;
-  name?: string;
-  arguments?: unknown;
-  output?: unknown;
+  action: {
+    commands: string[];
+    max_output_length?: number | null;
+    timeout_ms?: number | null;
+  };
+  environment?: ResponsesShellEnvironment | null;
+  status?: string | null;
+  caller?: ResponsesToolCaller | null;
+  created_by?: string;
 }
 
-export interface ResponsesMcpListToolsItem extends ResponsesPermissiveItem<'mcp_list_tools'> {
-  tools?: unknown[];
+export interface ResponsesShellCallOutputItem {
+  type: 'shell_call_output';
+  id?: string | null;
+  call_id: string;
+  max_output_length?: number | null;
+  output: Array<{
+    stdout: string;
+    stderr: string;
+    outcome: { type: 'timeout' } | { type: 'exit'; exit_code: number };
+    created_by?: string;
+  }>;
+  status?: string | null;
+  caller?: ResponsesToolCaller | null;
+  created_by?: string;
 }
 
-export interface ResponsesMcpApprovalRequestItem extends ResponsesPermissiveItem<'mcp_approval_request'> {
-  call_id?: string;
+export type ResponsesApplyPatchOperation =
+  | { type: 'create_file'; path: string; diff: string }
+  | { type: 'delete_file'; path: string }
+  | { type: 'update_file'; path: string; diff: string };
+
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L1472-L1643
+export interface ResponsesApplyPatchCallItem {
+  type: 'apply_patch_call';
+  id?: string | null;
+  call_id: string;
+  operation: ResponsesApplyPatchOperation;
+  status: 'in_progress' | 'completed';
+  caller?: ResponsesToolCaller | null;
+  created_by?: string;
 }
 
-export interface ResponsesMcpApprovalResponseItem extends ResponsesPermissiveItem<'mcp_approval_response'> {
-  call_id?: string;
-  output?: unknown;
+export interface ResponsesApplyPatchCallOutputItem {
+  type: 'apply_patch_call_output';
+  id?: string | null;
+  call_id: string;
+  status: 'completed' | 'failed';
+  output?: string | null;
+  caller?: ResponsesToolCaller | null;
+  created_by?: string;
+}
+
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L4727-L4892
+export interface ResponsesMcpCallItem {
+  type: 'mcp_call';
+  id: string;
+  arguments: string;
+  name: string;
+  server_label: string;
+  approval_request_id?: string | null;
+  error?: string | null;
+  output?: string | null;
+  status?: string;
+}
+
+export interface ResponsesMcpListToolsItem {
+  type: 'mcp_list_tools';
+  id: string;
+  server_label: string;
+  tools: Array<{
+    input_schema: unknown;
+    name: string;
+    annotations?: unknown | null;
+    description?: string | null;
+  }>;
+  error?: string | null;
+}
+
+export interface ResponsesMcpApprovalRequestItem {
+  type: 'mcp_approval_request';
+  id: string;
+  arguments: string;
+  name: string;
+  server_label: string;
+}
+
+export interface ResponsesMcpApprovalResponseItem {
+  type: 'mcp_approval_response';
+  id?: string | null;
+  approval_request_id: string;
+  approve: boolean;
+  reason?: string | null;
 }
 
 export interface ResponsesInputImageGenerationCall {
@@ -258,12 +639,25 @@ export interface ResponsesInputImageGenerationCall {
   error?: { message: string; code: string; type?: string };
 }
 
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L822-L851
+export type ResponsesToolAllowedCaller = 'direct' | 'programmatic';
+
 export interface ResponsesFunctionTool {
   type: 'function';
   name: string;
-  parameters: Record<string, unknown>;
-  strict: boolean;
-  description?: string;
+  // One interface serves both wire directions, and they disagree on
+  // `description`, `parameters` and `strict`: a request may omit all three,
+  // while the echoed response tool marks all three required with an explicit
+  // `null` alternative. The union of the two is optional-and-nullable, so a
+  // translator must handle absent and `null` alike.
+  // Request: https://github.com/openresponses/openresponses/blob/92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c/public/openapi/openapi.json#L808-L847
+  // Response: https://github.com/openresponses/openresponses/blob/92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c/public/openapi/openapi.json#L2141-L2192
+  description?: string | null;
+  parameters?: Record<string, unknown> | null;
+  strict?: boolean | null;
+  allowed_callers?: ResponsesToolAllowedCaller[] | null;
+  defer_loading?: boolean;
+  output_schema?: Record<string, unknown> | null;
 }
 
 // Codex and other Responses clients ship hosted server tools (web_search,
@@ -301,13 +695,22 @@ export interface ResponsesHostedTool {
     blocked_domains?: string[];
   };
   user_location?: {
+    type?: 'approximate';
     city?: string;
     region?: string;
     country?: string;
     timezone?: string;
   };
   search_context_size?: 'low' | 'medium' | 'high';
-  external_web_access?: boolean;
+  // Settings forwarded when the hosted tool is executed through Codex's
+  // standalone `/alpha/search` API.
+  // https://github.com/openai/codex/blob/2f19a57704fb7b1db032bc38cf995034254eaebb/codex-rs/codex-api/src/search.rs#L215-L295
+  external_web_access?: boolean | 'cached' | 'indexed' | 'live';
+  image_settings?: {
+    max_results?: number;
+    caption?: boolean;
+  };
+  allowed_callers?: Array<'direct' | 'shell' | 'code_interpreter'>;
   search_content_types?: string[];
   return_token_budget?: 'default' | 'unlimited';
   name?: string;
@@ -321,17 +724,109 @@ export interface ResponsesCustomTool {
   name: string;
   description?: string;
   format?: Record<string, unknown>;
+  allowed_callers?: ResponsesToolAllowedCaller[] | null;
+  defer_loading?: boolean;
 }
 
-export type ResponsesTool = ResponsesFunctionTool | ResponsesHostedTool | ResponsesCustomTool;
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L8110-L8115
+export interface ResponsesProgrammaticTool {
+  type: 'programmatic_tool_calling';
+}
 
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L7871-L8080
+export interface ResponsesMcpTool {
+  type: 'mcp';
+  server_label: string;
+  allowed_callers?: ResponsesToolAllowedCaller[] | null;
+  defer_loading?: boolean;
+  [key: string]: unknown;
+}
+
+export interface ResponsesCodeInterpreterTool {
+  type: 'code_interpreter';
+  container: string | Record<string, unknown>;
+  allowed_callers?: ResponsesToolAllowedCaller[] | null;
+}
+
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L541-L577
+export interface ResponsesComputerTool {
+  type: 'computer';
+}
+
+export interface ResponsesComputerUsePreviewTool {
+  type: 'computer_use_preview';
+  display_height: number;
+  display_width: number;
+  environment: 'windows' | 'mac' | 'linux' | 'ubuntu' | 'browser';
+}
+
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L729-L806
+export interface ResponsesFileSearchTool {
+  type: 'file_search';
+  vector_store_ids: string[];
+  filters?: Record<string, unknown> | null;
+  max_num_results?: number;
+  ranking_options?: {
+    hybrid_search?: { embedding_weight: number; text_weight: number };
+    ranker?: 'auto' | 'default-2024-11-15';
+    score_threshold?: number;
+  };
+}
+
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L8239-L8247
+export interface ResponsesLocalShellTool {
+  type: 'local_shell';
+}
+
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L803-L815
+export interface ResponsesShellTool {
+  type: 'shell';
+  allowed_callers?: ResponsesToolAllowedCaller[] | null;
+  environment?: unknown;
+}
+
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L245-L264
+export interface ResponsesApplyPatchTool {
+  type: 'apply_patch';
+  allowed_callers?: ResponsesToolAllowedCaller[] | null;
+}
+
+export type ResponsesTool =
+  | ResponsesFunctionTool
+  | ResponsesHostedTool
+  | ResponsesCustomTool
+  | ResponsesProgrammaticTool
+  | ResponsesMcpTool
+  | ResponsesCodeInterpreterTool
+  | ResponsesComputerTool
+  | ResponsesComputerUsePreviewTool
+  | ResponsesFileSearchTool
+  | ResponsesLocalShellTool
+  | ResponsesShellTool
+  | ResponsesApplyPatchTool;
+
+// https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L8250-L8400
 export type ResponsesToolChoice =
   | 'auto'
   | 'none'
   | 'required'
   | { type: 'function'; name: string }
   | { type: 'custom'; name: string }
-  | { type: ResponsesHostedToolType };
+  | { type: 'mcp'; server_label: string; name?: string | null }
+  | { type: 'allowed_tools'; mode: 'auto' | 'required'; tools: Array<Record<string, unknown>> }
+  | { type: 'shell' }
+  | { type: 'apply_patch' }
+  | { type: 'programmatic_tool_calling' }
+  | {
+    type:
+      | ResponsesHostedToolType
+      | 'file_search'
+      | 'computer'
+      | 'computer_use_preview'
+      | 'computer_use'
+      | 'code_interpreter'
+      | 'mcp';
+  };
 
 // ── Response types ──
 
@@ -351,7 +846,8 @@ export interface ResponsesResult {
   // that happen to emit it (some OpenAPI implementations do) are
   // preserved as-is on pass-through.
   output_text?: string;
-  status: 'completed' | 'incomplete' | 'failed' | 'in_progress';
+  // https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L6866-L6870
+  status: 'queued' | 'completed' | 'incomplete' | 'failed' | 'in_progress' | 'cancelled';
   // `error` and `incomplete_details` are REQUIRED on the wire shape
   // per the OpenAI Responses spec (both can be null). Reference:
   // https://github.com/openai/openai-openapi/blob/master/openapi.yaml
@@ -366,14 +862,112 @@ export interface ResponsesResult {
   // never synthesizes it.
   incomplete_details: { reason: string } | null;
   error: { message: string; code: string; type?: string } | null;
+  // https://developers.openai.com/api/reference/resources/responses/methods/create
+  service_tier?: 'default' | 'auto' | 'flex' | 'priority' | 'scale' | (string & {}) | null;
+  // Request params echoed back on the response body. The `Response`
+  // schema in OpenAI's openapi.yaml composes `ResponseProperties`, which
+  // declares both fields; observed upstream echoes (Copilot, Azure)
+  // confirm they're populated with server-enriched defaults.
+  tools?: ResponsesTool[];
+  tool_choice?: ResponsesToolChoice | null;
+  // The response resource requires `usage` and gives it an explicit `null`
+  // alternative, so `null` is what an upstream sends for a response that
+  // reported no token counts. The key stays optional because a partially built
+  // envelope carries no usage until the terminal event accounts for the turn.
+  // https://github.com/openresponses/openresponses/blob/92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c/public/openapi/openapi.json#L2613-L2629
+  // https://github.com/openresponses/openresponses/blob/92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c/public/openapi/openapi.json#L2691-L2723
   usage?: {
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
-    input_tokens_details?: { cached_tokens: number };
+    // Both fields are disjoint subsets of input_tokens. Older compatible
+    // upstreams may omit cache_write_tokens even when they provide details.
+    // https://github.com/openai/openai-python/blob/f16fbbd2bd25dc1ff150b5f78dbd15ff6bab6d91/src/openai/types/responses/response_usage.py
+    // https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L7259-L7269
+    input_tokens_details?: { cached_tokens: number; cache_write_tokens?: number };
     output_tokens_details?: { reasoning_tokens: number };
-  };
+  } | null;
+  // ── Further fields the response resource declares required ──
+  //
+  // Every key below is listed in `ResponseResource.required` — as are `tools`,
+  // `tool_choice`, `usage` and `service_tier` above — so a spec-conforming
+  // client-facing body must carry all of them:
+  // https://github.com/openresponses/openresponses/blob/92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c/public/openapi/openapi.json#L2691-L2723
+  // They stay optional here because this interface also models what an
+  // arbitrary upstream sends and what a translator assembles mid-stream.
+  // Presence on the client-facing body is carried by `ClientResponseResource`
+  // in `./client-resource.ts`, which derives from this interface rather than
+  // restating it.
+  //
+  // Unix seconds, not milliseconds.
+  created_at?: number;
+  // Null until the response reaches a terminal status.
+  completed_at?: number | null;
+  previous_response_id?: string | null;
+  instructions?: string | null;
+  truncation?: 'auto' | 'disabled' | (string & {}) | null;
+  parallel_tool_calls?: boolean;
+  text?: { format?: Record<string, unknown> | null; verbosity?: string | null } | null;
+  top_p?: number | null;
+  presence_penalty?: number | null;
+  frequency_penalty?: number | null;
+  top_logprobs?: number | null;
+  temperature?: number | null;
+  // `effort` and `summary` are themselves required whenever `reasoning` is an
+  // object; other keys upstreams add (`context`, `mode`) ride along untouched.
+  // https://github.com/openresponses/openresponses/blob/92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c/public/openapi/openapi.json#L2320-L2359
+  reasoning?: {
+    effort?: string | null;
+    summary?: 'detailed' | 'auto' | 'concise' | (string & {}) | null;
+    context?: 'auto' | 'current_turn' | 'all_turns' | (string & {}) | null;
+    [key: string]: unknown;
+  } | null;
+  max_output_tokens?: number | null;
+  max_tool_calls?: number | null;
+  // Whether the response was stored so it can be retrieved later — the wording
+  // of the schema's own description, which is why the gateway answers it from
+  // its store rather than from the request's `store` flag.
+  store?: boolean;
+  background?: boolean;
+  metadata?: Record<string, unknown> | null;
+  safety_identifier?: string | null;
+  prompt_cache_key?: string | null;
 }
+
+// Stored/output additional-tools roles are wider than the input-only
+// `developer` role.
+// https://github.com/openai/openai-node/blob/61539248cbe04665de68a71e6fd878127ae4db87/src/resources/responses/responses.ts#L5116-L5136
+export type ResponsesAdditionalToolsRole =
+  | 'unknown'
+  | 'user'
+  | 'assistant'
+  | 'system'
+  | 'critic'
+  | 'discriminator'
+  | 'developer'
+  | 'tool';
+
+export interface ResponsesOutputAdditionalToolsItem {
+  type: 'additional_tools';
+  id: string;
+  role: ResponsesAdditionalToolsRole;
+  tools: ResponsesTool[];
+}
+
+export type ResponsesOutputAgentMessageItem = Omit<ResponsesInputAgentMessageItem, 'id' | 'agent'> & {
+  id: string;
+  agent?: { agent_name: string };
+};
+
+export type ResponsesOutputMultiAgentCallItem = Omit<ResponsesInputMultiAgentCallItem, 'id' | 'agent'> & {
+  id: string;
+  agent?: { agent_name: string };
+};
+
+export type ResponsesOutputMultiAgentCallOutputItem = Omit<ResponsesInputMultiAgentCallOutputItem, 'id' | 'agent'> & {
+  id: string;
+  agent?: { agent_name: string };
+};
 
 export type ResponsesOutputItem =
   | ResponsesOutputMessage
@@ -388,6 +982,13 @@ export type ResponsesOutputItem =
   | ResponsesComputerCallOutputItem
   | ResponsesToolSearchCallItem
   | ResponsesToolSearchOutputItem
+  | ResponsesOutputAdditionalToolsItem
+  | ResponsesProgramItem
+  | ResponsesProgramOutputItem
+  | ResponsesOutputAgentMessageItem
+  | ResponsesOutputMultiAgentCallItem
+  | ResponsesOutputMultiAgentCallOutputItem
+  | ResponsesContextCompactionItem
   | ResponsesCompactionItem
   | ResponsesCodeInterpreterCallItem
   | ResponsesLocalShellCallItem
@@ -402,22 +1003,40 @@ export type ResponsesOutputItem =
   | ResponsesMcpApprovalResponseItem
   | ResponsesOutputImageGenerationCall;
 
+// The Responses item schema requires `status` on an output message and
+// `annotations` on every `output_text` part, even when the text carries no
+// citations, so both are modeled as required and the compiler forces every
+// producer to state them:
+// https://github.com/openai/openai-openapi/blob/d2f04809d7961f01e94031e1f31617394599dbdd/openapi.yaml#L44868-L44873
+// https://github.com/openai/openai-openapi/blob/d2f04809d7961f01e94031e1f31617394599dbdd/openapi.yaml#L66303-L66307
+// `id` is schema-required too but stays optional: an upstream item that omits
+// it is surfaced by `requireItemId` rather than given an invented value.
 export interface ResponsesOutputMessage {
   type: 'message';
   id?: string;
-  status?: string;
+  status: string;
   role: 'assistant';
   content: ResponsesOutputContentBlock[];
+  phase?: ResponsesMessagePhase;
 }
 
 export type ResponsesOutputContentBlock = ResponsesOutputText | ResponsesOutputRefusal;
 
-interface ResponsesOutputText {
-  type: 'output_text';
-  text: string;
+export interface ResponsesAnnotation {
+  type: 'url_citation';
+  url: string;
+  title: string;
+  start_index: number;
+  end_index: number;
 }
 
-interface ResponsesOutputRefusal {
+export interface ResponsesOutputText {
+  type: 'output_text';
+  text: string;
+  annotations: ResponsesAnnotation[];
+}
+
+export interface ResponsesOutputRefusal {
   type: 'refusal';
   refusal: string;
 }
@@ -427,19 +1046,13 @@ export interface ResponsesOutputFunctionCall {
   id?: string;
   call_id: string;
   name: string;
+  namespace?: string;
   arguments: string;
   status: string;
+  caller?: ResponsesToolCaller | null;
 }
 
-export interface ResponsesOutputCustomToolCall {
-  type: 'custom_tool_call';
-  call_id: string;
-  name: string;
-  input: string;
-  id?: string;
-  namespace?: string;
-  status?: string;
-}
+export type ResponsesOutputCustomToolCall = ResponsesCustomToolCallItem;
 
 export interface ResponsesOutputReasoning {
   type: 'reasoning';
@@ -501,7 +1114,13 @@ export interface ResponsesOutputImageGenerationCall {
 
 // ── Stream event types ──
 
-export type ResponsesStreamEvent =
+// Spec marks sequence_number required, but some Copilot upstreams omit it
+// on the wire; the stream parser backfills a monotonic counter when missing.
+export type ResponsesStreamEvent = ResponsesStreamEventVariant & { sequence_number?: number };
+
+type ResponsesStreamEventVariant =
+  // https://github.com/openai/openai-node/blob/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/responses/responses.ts#L6456-L6471
+  | { type: 'response.queued'; response: ResponsesResult }
   | { type: 'response.created'; response: ResponsesResult }
   | { type: 'response.in_progress'; response: ResponsesResult }
   | {
@@ -556,6 +1175,22 @@ export type ResponsesStreamEvent =
     summary_index: number;
     text: string;
   }
+  // https://github.com/openai/openai-python/blob/d4dceb221b9a92c55c232d5b330ae89beb539415/src/openai/types/responses/response_reasoning_text_delta_event.py#L9-L31
+  // https://github.com/openai/openai-python/blob/d4dceb221b9a92c55c232d5b330ae89beb539415/src/openai/types/responses/response_reasoning_text_done_event.py#L9-L34
+  | {
+    type: 'response.reasoning_text.delta';
+    item_id: string;
+    output_index: number;
+    content_index: number;
+    delta: string;
+  }
+  | {
+    type: 'response.reasoning_text.done';
+    item_id: string;
+    output_index: number;
+    content_index: number;
+    text: string;
+  }
   | {
     type: 'response.output_text.delta';
     item_id: string;
@@ -571,19 +1206,26 @@ export type ResponsesStreamEvent =
     text: string;
   }
   | {
+    type: 'response.refusal.delta';
+    item_id: string;
+    output_index: number;
+    content_index: number;
+    delta: string;
+  }
+  | {
+    type: 'response.refusal.done';
+    item_id: string;
+    output_index: number;
+    content_index: number;
+    refusal: string;
+  }
+  | {
     type: 'response.output_text.annotation.added';
     output_index: number;
     content_index: number;
     annotation_index: number;
     item_id: string;
-    annotation:
-      | {
-        type: 'url_citation';
-        url: string;
-        title: string;
-        start_index: number;
-        end_index: number;
-      };
+    annotation: ResponsesAnnotation;
   }
   | {
     type: 'response.web_search_call.in_progress';
@@ -653,6 +1295,40 @@ export type ResponsesStreamEvent =
     output_index: number;
     input: string;
   }
+  // https://github.com/vercel/ai/blob/6b6a8bbe9247e0ed70c8a7f6e850a1ab16096528/packages/openai/src/responses/__fixtures__/openai-shell-tool.1.chunks.txt#L4-L10
+  | {
+    type: 'response.shell_call_command.added';
+    output_index: number;
+    command_index: number;
+    command: string;
+  }
+  | {
+    type: 'response.shell_call_command.delta';
+    output_index: number;
+    command_index: number;
+    delta: string;
+    obfuscation?: string;
+  }
+  | {
+    type: 'response.shell_call_command.done';
+    output_index: number;
+    command_index: number;
+    command: string;
+  }
+  // https://github.com/vercel/ai/blob/6b6a8bbe9247e0ed70c8a7f6e850a1ab16096528/packages/openai/src/responses/__fixtures__/openai-apply-patch-tool.1.chunks.txt#L4-L36
+  | {
+    type: 'response.apply_patch_call_operation_diff.delta';
+    item_id: string;
+    output_index: number;
+    delta: string;
+    obfuscation?: string;
+  }
+  | {
+    type: 'response.apply_patch_call_operation_diff.done';
+    item_id: string;
+    output_index: number;
+    diff: string;
+  }
   | { type: 'response.completed'; response: ResponsesResult }
   | { type: 'response.incomplete'; response: ResponsesResult }
   | { type: 'response.failed'; response: ResponsesResult }
@@ -663,48 +1339,8 @@ export type ResponsesStreamEvent =
     name?: string;
     stack?: string;
     cause?: unknown;
-    source_api?: string;
     target_api?: string;
-  }
-  | { type: 'ping' };
-
-// Forward-compatibility escape hatch for unknown event types. Earlier
-// versions of `ResponsesStreamEvent` ended with a permissive
-// `{ type: string; [key: string]: unknown }` catch-all in the union;
-// because that branch matches any object with a `type` field and any
-// extra keys, it silently let test fixtures compile against
-// `ResponsesStreamEvent` while missing required fields on the
-// `response` member (e.g. spec-required `error: null` /
-// `incomplete_details: null` on `response.created.response`). Splitting
-// the catch-all into a separate exported type means callers that need
-// to accept unknown future events must opt in explicitly (and assume
-// the responsibility of asserting field shapes themselves) instead of
-// letting every malformed fixture compile through silently.
-export interface UnknownResponsesStreamEvent {
-  type: string;
-  [key: string]: unknown;
-}
-
-// Union for consumers that explicitly need to accept future / unknown
-// event types alongside the strongly-typed ones. Use this when reading
-// from an upstream wire we do not fully control. Producers (test
-// fixtures, gateway synthesizers) should keep using
-// `ResponsesStreamEvent` so missing required fields are caught at
-// compile time.
-export type ResponsesStreamEventOrUnknown = ResponsesStreamEvent | UnknownResponsesStreamEvent;
-
-// Gateway-side extension: upstream Responses streams may omit `sequence_number`
-// when probing, so the gateway-internal shape leaves it optional.
-export type RawResponsesStreamEvent = ResponsesStreamEvent & {
-  sequence_number?: number;
-};
-
-// Sibling of RawResponsesStreamEvent for sequences synthesized inside the
-// gateway (from-result expansion, from-stream projection), where the
-// sequence number is always present.
-export type SequencedResponsesStreamEvent = ResponsesStreamEvent & {
-  sequence_number: number;
-};
+  };
 
 // Either side of the Responses reasoning round trip: input echoes a prior
 // turn's reasoning back in, output emits the current turn's reasoning. Shape
@@ -714,6 +1350,34 @@ export type ResponsesReasoningItem = ResponsesInputReasoning | ResponsesOutputRe
 export const isResponsesTerminalEvent = (event: Pick<ResponsesStreamEvent, 'type'>): boolean =>
   event.type === 'response.completed' || event.type === 'response.incomplete' || event.type === 'response.failed' || event.type === 'error';
 
+// Typed accessor for the `response` payload carried on lifecycle envelopes
+// (`response.queued`, `response.created`, `response.in_progress`, `response.completed`,
+// `response.incomplete`, `response.failed`). Returns null on every other
+// event type so callers don't have to reproduce the variant check.
+export const responsesResultFromStreamEvent = (event: ResponsesStreamEvent): ResponsesResult | null =>
+  'response' in event ? event.response : null;
+
+export {
+  type CanonicalResponsesCompactPayload,
+  type ResponsesCompactionResult,
+  type ResponsesCompactPayload,
+  toCompactPayloadShape,
+} from './compact.ts';
 export { responsesResultToEvents } from './from-result.ts';
 export { imageGenerationCallLifecycleEvents } from './image-generation-lifecycle.ts';
 export { webSearchCallLifecycleEvents } from './web-search-lifecycle.ts';
+export { parseResponsesStream, type ParseResponsesStreamOptions } from './stream.ts';
+
+export type {
+  ClientResponseResource,
+  ClientResponsesCompaction,
+  ClientResponsesReasoning,
+  ClientResponsesStreamEvent,
+  ClientResponsesTextField,
+  ClientResponsesTool,
+  ClientResponsesUsage,
+} from './client-resource.ts';
+export { RESPONSES_MISSING_TERMINAL_MESSAGE, collectResponsesProtocolEventsToResult } from './to-result.ts';
+export { createRandomResponsesItemId, type GeneratedResponsesItemType } from './item-id.ts';
+export { reassembleResponsesEvents } from './reassemble.ts';
+export { responsesProtocolFrameToSSEFrame } from './to-sse.ts';
